@@ -340,7 +340,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         } else {
             groups = nodeGroupStorage.scan(key -> key.startsWith(prefix));
         }
-        return groups.stream().filter(group -> group.getStatus() == NodegroupStatus.ACTIVE)
+        return groups.stream().filter(group -> group.getStatus() == NodegroupStatus.ACTIVE
+                        || group.getStatus() == NodegroupStatus.UPDATING)
                 .min(Comparator.comparing(Nodegroup::getCreatedAt,
                         Comparator.nullsLast(Comparator.naturalOrder()))
                 .thenComparing(Nodegroup::getNodegroupName));
@@ -1024,10 +1025,6 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             boolean firstGroup = firstNodeGroup(clusterName, accountId).isEmpty() && pendingFirst == null;
             if (firstGroup && !config.services().eks().mock() && clusterManager != null) {
                 applyFirstNodeGroupCapacity(clusterName, nodegroupName, currentCluster, nodeGroup);
-                if (currentCluster.getContainerId() != null && currentCluster.getStatus() == ClusterStatus.ACTIVE) {
-                    LOG.infov("EKS cluster {0} is already running; nodegroup {1} node labels and taints are not applied to the running node",
-                            clusterName, nodegroupName);
-                }
             } else if (!firstGroup && pendingFirst == null
                     && !config.services().eks().mock() && clusterManager != null) {
                 if (currentCluster.getNodeInstanceType() == null) {
@@ -1106,7 +1103,24 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 }
             }
         }
+        if (nodeGroup.getStatus() == NodegroupStatus.ACTIVE) {
+            syncNodeWhenRunning(clusterName);
+        }
         return nodeGroup;
+    }
+
+    /**
+     * Brings the running node in line with the cluster's node groups. A node replaced to change its
+     * capacity is synced by the readiness poller once its API server answers, so it is left alone here.
+     */
+    private void syncNodeWhenRunning(String clusterName) {
+        if (config.services().eks().mock() || clusterManager == null) {
+            return;
+        }
+        storage.get(clusterName)
+                .filter(cluster -> cluster.getContainerId() != null && !cluster.isFinalizePending()
+                        && cluster.getStatus() == ClusterStatus.ACTIVE)
+                .ifPresent(clusterManager::syncNodegroupToNode);
     }
 
     private void applyFirstNodeGroupCapacity(String clusterName, String nodegroupName,
@@ -1203,13 +1217,15 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     public Nodegroup deleteNodeGroup(String clusterName, String nodegroupName) {
         Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
+        Nodegroup nodeGroup;
         synchronized (capacityLock) {
-            Nodegroup nodeGroup = describeNodeGroup(clusterName, nodegroupName);
+            nodeGroup = describeNodeGroup(clusterName, nodegroupName);
             nodeGroup.setStatus(NodegroupStatus.DELETING);
             nodeGroup.setModifiedAt(Instant.now());
             nodeGroupStorage.delete(nodeGroupKey(clusterName, nodegroupName));
-            return nodeGroup;
         }
+        syncNodeWhenRunning(clusterName);
+        return nodeGroup;
     }
 
     public FargateProfile createFargateProfile(String clusterName, CreateFargateProfileRequest request) {

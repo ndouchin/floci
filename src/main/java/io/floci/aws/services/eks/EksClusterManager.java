@@ -1,6 +1,10 @@
 package io.floci.aws.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
@@ -94,6 +98,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiFunction;
@@ -116,6 +121,14 @@ public class EksClusterManager
     private static final String NODE_CAPACITY_LABEL = "io.floci.eks.node-capacity";
     private static final String DEFAULT_STORAGE_CLASS_LABEL = "io.floci.eks.default-storage-class";
     private static final String ENDPOINT_HOST_LABEL = "io.floci.eks.endpoint-host";
+    static final String MANAGED_LABELS_ANNOTATION = "floci.io/eks-nodegroup-labels";
+    static final String MANAGED_TAINTS_ANNOTATION = "floci.io/eks-nodegroup-taints";
+    private static final String INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type";
+    private static final String BETA_INSTANCE_TYPE_LABEL = "beta.kubernetes.io/instance-type";
+    private static final Set<String> NODE_IDENTITY_LABELS = Set.of("topology.kubernetes.io/zone",
+            "topology.kubernetes.io/region", INSTANCE_TYPE_LABEL, BETA_INSTANCE_TYPE_LABEL);
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Duration NODE_REGISTRATION_WAIT = Duration.ofMinutes(2);
     private static final Pattern HOSTNAME = Pattern.compile(
             "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*");
 
@@ -184,6 +197,7 @@ public class EksClusterManager
     private final Map<String, Closeable> clusterLogHandles = new ConcurrentHashMap<>();
     private final List<Consumer<Instance>> nodeRegistrationListeners = new CopyOnWriteArrayList<>();
     private final Map<String, Cluster> activeClusters = new ConcurrentHashMap<>();
+    private final Map<String, Object> nodeSyncLocks = new ConcurrentHashMap<>();
 
     @Inject
     jakarta.enterprise.inject.Instance<Ec2Service> ec2ServiceInstance;
@@ -1065,6 +1079,8 @@ public class EksClusterManager
             pruneLegacyClusterNodes(cluster, containerId);
 
             registerAllJoinedNodes(cluster, containerId);
+
+            syncNodegroupToNodeWhenRegistered(cluster);
 
             LOG.infov("Finalized EKS cluster {0} with CA data extracted", cluster.getName());
         } catch (Exception e) {
@@ -2721,7 +2737,8 @@ public class EksClusterManager
             groups = nodeGroupStorage.scan(key -> key.startsWith(prefix));
         }
         return groups.stream()
-                .filter(g -> g.getStatus() == null || g.getStatus() == NodegroupStatus.ACTIVE)
+                .filter(g -> g.getStatus() == null || g.getStatus() == NodegroupStatus.ACTIVE
+                        || g.getStatus() == NodegroupStatus.UPDATING)
                 .sorted(Comparator.comparing(Nodegroup::getCreatedAt,
                                 Comparator.nullsLast(Comparator.naturalOrder()))
                         .thenComparing(Nodegroup::getNodegroupName,
@@ -2748,6 +2765,21 @@ public class EksClusterManager
     }
 
     String buildNodeLabels(Cluster cluster, Nodegroup nodegroup, String az, String region) {
+        Map<String, String> labels = nodeLabelMap(cluster, nodegroup, az, region);
+        if (labels.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> entry : labels.entrySet()) {
+            if (!sb.isEmpty()) {
+                sb.append(",");
+            }
+            sb.append(entry.getKey()).append("=").append(entry.getValue());
+        }
+        return sb.toString();
+    }
+
+    private Map<String, String> nodeLabelMap(Cluster cluster, Nodegroup nodegroup, String az, String region) {
         Map<String, String> labels = new LinkedHashMap<>();
         if (az != null && !az.isBlank()) {
             labels.put("topology.kubernetes.io/zone", az);
@@ -2785,18 +2817,7 @@ public class EksClusterManager
                 }
             }
         }
-
-        if (labels.isEmpty()) {
-            return null;
-        }
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, String> entry : labels.entrySet()) {
-            if (!sb.isEmpty()) {
-                sb.append(",");
-            }
-            sb.append(entry.getKey()).append("=").append(entry.getValue());
-        }
-        return sb.toString();
+        return labels;
     }
 
     private static boolean isReservedNodeLabelKey(String key) {
@@ -2899,6 +2920,216 @@ public class EksClusterManager
             case "PREFER_NO_SCHEDULE", "PREFERNOSCHEDULE" -> "PreferNoSchedule";
             default -> awsEffect.trim();
         };
+    }
+
+    /**
+     * Puts the first node group's labels and taints on the cluster's running node through its API
+     * server, and takes off those an earlier sync put there that no longer apply. The kubelet sets
+     * {@code --node-labels} and {@code --register-with-taints} only when it registers a node, so a
+     * node group created or updated after the node registered reaches the node only this way. The
+     * keys Floci manages are recorded in two node annotations, so a later sync removes nothing a
+     * workload or an operator added. Failures are logged; the cluster keeps running.
+     */
+    public boolean syncNodegroupToNode(Cluster cluster) {
+        String containerId = cluster == null ? null : cluster.getContainerId();
+        if (containerId == null || containerId.isBlank()) {
+            return true;
+        }
+        synchronized (nodeSyncLocks.computeIfAbsent(clusterResourceName(cluster), key -> new Object())) {
+            try {
+                List<Nodegroup> groups = listActiveNodegroups(cluster);
+                Nodegroup nodegroup = groups.isEmpty() ? null : groups.getFirst();
+                String region = clusterRegion(cluster);
+                Map<String, String> labels = nodeLabelMap(cluster, nodegroup,
+                        deriveClusterNodeAvailabilityZone(cluster, region), region);
+                String instanceType = labels.get(INSTANCE_TYPE_LABEL);
+                if (instanceType != null) {
+                    labels.put(BETA_INSTANCE_TYPE_LABEL, instanceType);
+                }
+                return applyNodePatch(cluster, containerId, deriveClusterNodePrivateDnsName(cluster),
+                        labels, nodegroupTaints(nodegroup));
+            } catch (Exception e) {
+                LOG.warnv("Could not apply node group labels and taints to the node of EKS cluster {0}: {1}",
+                        cluster.getName(), e.getMessage());
+                return true;
+            }
+        }
+    }
+
+    /**
+     * {@link #syncNodegroupToNode} for a node that may not have registered yet: the API server of a
+     * started or replaced container answers a few seconds before its kubelet creates the Node, so the
+     * sync is retried in the background until the node exists, the container is replaced again, or
+     * two minutes pass.
+     */
+    void syncNodegroupToNodeWhenRegistered(Cluster cluster) {
+        String containerId = cluster.getContainerId();
+        CompletableFuture.runAsync(() -> {
+            long deadline = System.currentTimeMillis() + NODE_REGISTRATION_WAIT.toMillis();
+            while (containerId != null && containerId.equals(cluster.getContainerId())) {
+                if (syncNodegroupToNode(cluster)) {
+                    return;
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    LOG.warnv("The node of EKS cluster {0} could not be read for two minutes; its node group "
+                            + "labels and taints were not applied", cluster.getName());
+                    return;
+                }
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        });
+    }
+
+    /**
+     * False while the node cannot be read, because it has not registered yet or the API server is still
+     * starting; true once the node was patched, or the sync gave up.
+     */
+    private boolean applyNodePatch(Cluster cluster, String containerId, String nodeName,
+                                   Map<String, String> labels, List<Map<String, String>> taints) throws IOException {
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            ContainerExec.Result current = execInContainerForResult(containerId,
+                    new String[]{"kubectl", "get", "node", nodeName, "-o", "json"}, 15);
+            if (current.exitCode() != 0) {
+                LOG.debugv("EKS cluster {0}: cannot read node {1} yet: {2}", cluster.getName(), nodeName,
+                        current.stdout());
+                return false;
+            }
+            String patch = buildNodePatch(JSON.readTree(current.stdout()), labels, taints);
+            if (patch == null) {
+                return true;
+            }
+            ContainerExec.Result patched = execInContainerForResult(containerId,
+                    new String[]{"kubectl", "patch", "node", nodeName, "--type=merge", "-p", patch}, 15);
+            if (patched.exitCode() == 0) {
+                LOG.infov("Applied node group labels and taints to node {0} of EKS cluster {1}",
+                        nodeName, cluster.getName());
+                return true;
+            }
+            if (patched.stdout() == null || !patched.stdout().contains("the object has been modified")) {
+                throw new IllegalStateException("kubectl patch node " + nodeName + " failed: " + patched.stdout());
+            }
+        }
+        throw new IllegalStateException("node " + nodeName + " kept changing while it was patched");
+    }
+
+    static List<Map<String, String>> nodegroupTaints(Nodegroup nodegroup) {
+        List<Map<String, String>> taints = new ArrayList<>();
+        if (nodegroup == null || nodegroup.getTaints() == null) {
+            return taints;
+        }
+        for (Object taint : nodegroup.getTaints()) {
+            if (taint instanceof Map<?, ?> map && map.get("key") != null && !map.get("key").toString().isBlank()) {
+                Map<String, String> entry = new LinkedHashMap<>();
+                entry.put("key", map.get("key").toString().trim());
+                Object value = map.get("value");
+                if (value != null && !value.toString().isBlank()) {
+                    entry.put("value", value.toString().trim());
+                }
+                entry.put("effect", mapTaintEffect(map.get("effect") != null ? map.get("effect").toString() : null));
+                taints.removeIf(existing -> existing.get("key").equals(entry.get("key"))
+                        && existing.get("effect").equals(entry.get("effect")));
+                taints.add(entry);
+            }
+        }
+        return taints;
+    }
+
+    /**
+     * The merge patch that takes {@code node} to the given node group labels and taints, or null when
+     * it already carries them. Labels and taints recorded as Floci's in the node's annotations and no
+     * longer wanted are removed; the zone, region and instance-type labels the node registered with
+     * are only ever overwritten. A taint is identified by its key and effect, as Kubernetes does.
+     */
+    static String buildNodePatch(JsonNode node, Map<String, String> labels, List<Map<String, String>> taints) {
+        JsonNode metadata = node.path("metadata");
+        JsonNode currentLabels = metadata.path("labels");
+        JsonNode annotations = metadata.path("annotations");
+        Set<String> managedLabels = splitAnnotation(annotations.path(MANAGED_LABELS_ANNOTATION).asText(""));
+        Set<String> managedTaints = splitAnnotation(annotations.path(MANAGED_TAINTS_ANNOTATION).asText(""));
+
+        ObjectNode labelPatch = JSON.createObjectNode();
+        for (String key : managedLabels) {
+            if (!labels.containsKey(key) && !NODE_IDENTITY_LABELS.contains(key) && currentLabels.has(key)) {
+                labelPatch.putNull(key);
+            }
+        }
+        labels.forEach((key, value) -> {
+            if (!value.equals(currentLabels.path(key).asText(null))) {
+                labelPatch.put(key, value);
+            }
+        });
+
+        Set<String> wantedTaints = new LinkedHashSet<>();
+        taints.forEach(taint -> wantedTaints.add(taint.get("key") + ":" + taint.get("effect")));
+        ArrayNode currentTaints = node.path("spec").path("taints") instanceof ArrayNode array
+                ? array : JSON.createArrayNode();
+        ArrayNode nextTaints = JSON.createArrayNode();
+        for (JsonNode taint : currentTaints) {
+            String id = taint.path("key").asText() + ":" + taint.path("effect").asText();
+            if (!managedTaints.contains(id) && !wantedTaints.contains(id)) {
+                nextTaints.add(taint);
+            }
+        }
+        for (Map<String, String> taint : taints) {
+            ObjectNode entry = nextTaints.addObject();
+            taint.forEach(entry::put);
+        }
+        boolean taintsChanged = !sameTaints(currentTaints, nextTaints);
+
+        String labelRecord = String.join(",", labels.keySet().stream()
+                .filter(key -> !NODE_IDENTITY_LABELS.contains(key)).sorted().toList());
+        String taintRecord = String.join(",", wantedTaints.stream().sorted().toList());
+        boolean recordChanged = !labelRecord.equals(annotations.path(MANAGED_LABELS_ANNOTATION).asText(""))
+                || !taintRecord.equals(annotations.path(MANAGED_TAINTS_ANNOTATION).asText(""));
+        if (labelPatch.isEmpty() && !taintsChanged && !recordChanged) {
+            return null;
+        }
+
+        ObjectNode patch = JSON.createObjectNode();
+        ObjectNode patchMetadata = patch.putObject("metadata");
+        if (metadata.hasNonNull("resourceVersion")) {
+            patchMetadata.put("resourceVersion", metadata.get("resourceVersion").asText());
+        }
+        if (!labelPatch.isEmpty()) {
+            patchMetadata.set("labels", labelPatch);
+        }
+        ObjectNode annotationPatch = patchMetadata.putObject("annotations");
+        annotationPatch.put(MANAGED_LABELS_ANNOTATION, labelRecord);
+        annotationPatch.put(MANAGED_TAINTS_ANNOTATION, taintRecord);
+        if (taintsChanged) {
+            ObjectNode spec = patch.putObject("spec");
+            if (nextTaints.isEmpty()) {
+                spec.putNull("taints");
+            } else {
+                spec.set("taints", nextTaints);
+            }
+        }
+        return patch.toString();
+    }
+
+    private static boolean sameTaints(ArrayNode current, ArrayNode next) {
+        Set<String> left = new LinkedHashSet<>();
+        Set<String> right = new LinkedHashSet<>();
+        current.forEach(taint -> left.add(taint.path("key").asText() + "=" + taint.path("value").asText("")
+                + ":" + taint.path("effect").asText()));
+        next.forEach(taint -> right.add(taint.path("key").asText() + "=" + taint.path("value").asText("")
+                + ":" + taint.path("effect").asText()));
+        return left.equals(right);
+    }
+
+    private static Set<String> splitAnnotation(String value) {
+        Set<String> entries = new LinkedHashSet<>();
+        for (String entry : value.split(",")) {
+            if (!entry.isBlank()) {
+                entries.add(entry.trim());
+            }
+        }
+        return entries;
     }
 
     String deriveClusterNodeAvailabilityZone(Cluster cluster, String region) {
