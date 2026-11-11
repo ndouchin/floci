@@ -29,9 +29,14 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
 | `UpdateAddon` | Update addon configuration, version, or service account role |
-| `DescribeUpdate` | Describe an update for an addon |
+| `UpdateClusterVersion` | Move the cluster's Kubernetes version one minor version up |
+| `UpdateNodegroupConfig` | Change a node group's labels, taints, scaling, update, repair or warm pool configuration |
+| `UpdateNodegroupVersion` | Move a node group to its cluster's Kubernetes version, or another release or launch template version |
+| `DescribeUpdate` | Describe a cluster, node group or addon update |
+| `ListUpdates` | List the update IDs of a cluster, node group or addon, with pagination |
 | `DeleteAddon` | Delete an addon from a cluster |
 | `DescribeAddonVersions` | Describe supported addon versions by Kubernetes version or addon name |
+| `ListIdentityProviderConfigs` | List identity provider configs (always empty: they are not implemented) |
 | `CreateNodegroup` | Create node group metadata for a cluster |
 | `DescribeNodegroup` | Describe a node group by cluster and name |
 | `ListNodegroups` | List node group names for a cluster |
@@ -194,13 +199,41 @@ Floci supports the EKS cluster addon management plane for AWS SDKs and Terraform
 - **Retrieval**: `DescribeAddon` returns the complete addon resource shape, including ARN, cluster name, version, status (`ACTIVE`), health issues, tags, service account role ARN, configuration values, pod identity associations, owner, and publisher.
 - **Listing**: `ListAddons` lists installed addon names with pagination (`maxResults` and `nextToken`).
 - **Updating**: `UpdateAddon` updates the addon version, configuration values, service account role ARN, or resolve-conflicts strategy. It returns an `Update` tracking object and updates the addon metadata.
-- **Update tracking**: `DescribeUpdate` describes the status of an addon update (such as an in-place addon version update queried by Terraform).
+- **Update tracking**: `DescribeUpdate` describes the status of an addon update (such as an in-place addon version update queried by Terraform), and `ListUpdates` with `addonName` lists them. Addon updates are `Successful` as soon as they are made.
 - **Deletion**: `DeleteAddon` marks the addon as `DELETING` and removes it from the cluster. Deleting a cluster automatically cleans up all associated addons.
 - **Supported versions**: `DescribeAddonVersions` queries the addon version catalog with optional filtering by `addonName` and `kubernetesVersion`, supporting pagination. As in AWS, a `kubernetesVersion` filter also limits each version's `compatibilities` to that Kubernetes version. The catalog in `src/main/resources/eks/addon-versions.json` holds the parts of AWS's `DescribeAddonVersions` answer that Floci serves, for every Kubernetes version Floci can run; `make eks-addons-sync` regenerates it from `DescribeAddonVersions` with any AWS account's credentials.
 
 ### Metadata recording only
 
 Addons in Floci are recorded metadata only. Creating or updating an addon does not install or reconcile Kubernetes DaemonSets, Deployments, or custom resources inside the cluster container.
+
+## Cluster and node group updates
+
+`UpdateClusterVersion`, `UpdateNodegroupConfig` and `UpdateNodegroupVersion` return an [`Update`](https://docs.aws.amazon.com/eks/latest/APIReference/API_Update.html) with status `InProgress`, as EKS does; poll `DescribeUpdate` until it is `Successful` or `Failed`. Repeating a call with the same `clientRequestToken` returns the update the first call started. Metadata-only clusters (mock mode, or no Docker daemon) finish an update as soon as it is recorded. [`ListUpdates`](https://docs.aws.amazon.com/eks/latest/APIReference/API_ListUpdates.html) lists the cluster's own updates, or with `nodegroupName` or `addonName` those of that node group or addon, oldest first, with `maxResults` from 1 to 100 and `nextToken`. `DescribeUpdate` returns an update whether or not the request names its node group or addon, and refuses one that names another. Updates in progress when Floci stops are marked `Failed` at the next start.
+
+### Cluster version
+
+[`UpdateClusterVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateClusterVersion.html) accepts the next minor version only. Any other version, including the current one and older ones, is refused with `InvalidParameterException` and the message EKS returns, `Unsupported Kubernetes minor version update from 1.33 to 1.35` (as reported in [rancher/rancher#41643](https://github.com/rancher/rancher/issues/41643); AWS does not document the message). As the API reference requires, every managed node group must run the cluster's current version first; otherwise the call fails with `InvalidRequestException` and `Nodegroups <names> must be updated to match cluster version <version> before updating cluster version`, the message seen in [terraform-provider-aws#19478](https://github.com/hashicorp/terraform-provider-aws/issues/19478) (the error code is not shown there; `InvalidRequestException` is Floci's reading of "the request is invalid given the state of the cluster"). `force` overrides nothing. A cluster that is not `ACTIVE`, or whose node is being replaced, answers `ResourceInUseException`.
+
+The update reports `Version` and `PlatformVersion` (`eks.1`) parameters, as in the API reference example. The cluster is `UPDATING` while Floci recreates its k3s container on the image of the new version, keeping the named data volume, so workloads and objects survive, and the published API port and certificate authority, so kubeconfigs stay valid. It returns to `ACTIVE` once the new API server answers `/readyz`, with `version` and `platformVersion` updated and the update `Successful`. If the new container cannot start, Floci restores the previous one and the update is `Failed`. Node group versions do not change: in EKS the nodes keep their kubelet until `UpdateNodegroupVersion`, but Floci's only node is the server's own kubelet, which runs the new version at once.
+
+A cluster created without `version` runs the configured default image (`rancher/k3s:latest`) while reporting 1.29. Recreating it on an older minor than that image runs would downgrade its data, which k3s does not support, so Floci refuses such an update with `InvalidRequestException`; create the cluster with an explicit version to update it.
+
+### Node group configuration
+
+[`UpdateNodegroupConfig`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupConfig.html) applies `labels` (`addOrUpdateLabels`, `removeLabels`), `taints` (`addOrUpdateTaints`, `removeTaints`, a taint being identified by its key and effect), `scalingConfig` (only the members sent change), `updateConfig`, `nodeRepairConfig` and `warmPoolConfig`. The update has type `ConfigUpdate` and one parameter per change: `MinSize`, `MaxSize` and `DesiredSize` as in the API reference example, `LabelsToAdd`, `LabelsToRemove`, `TaintsToAdd` and `TaintsToRemove` as JSON (the encoding of these four values is not documented by AWS and is Floci's choice), and `MaxUnavailable`, `MaxUnavailablePercentage`, `UpdateStrategy`, `NodeRepairEnabled` and the `WarmPool*` parameters. The node group is `UPDATING` until the change is stored and, for the first node group, its labels and taints are on the running node (see [Timing and post-start nodegroups](#timing-and-post-start-nodegroups)). Floci refuses with `InvalidParameterException` a label both added and removed, a taint without a key or with an effect other than `NO_SCHEDULE`, `NO_EXECUTE` or `PREFER_NO_SCHEDULE`, more than 50 taints, a scaling configuration that breaks `0 <= minSize <= desiredSize <= maxSize` with `maxSize >= 1`, and a request that changes nothing; these messages are Floci's. A node group or cluster that is not `ACTIVE` answers `ResourceInUseException`. `desiredSize` is recorded but does not add nodes: a cluster has one node.
+
+### Node group version
+
+[`UpdateNodegroupVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupVersion.html) moves a node group to `version`, by default the cluster's version, and `releaseVersion`, by default `<version>-eks-1`. A version newer than the cluster's, or older than the node group's ("You cannot roll back a node group to an earlier Kubernetes version"), is refused with `InvalidParameterException`. A `launchTemplate` is accepted only for a node group created with one and must name the same template ID or name, as the API reference requires; its version is resolved in EC2. The update has type `VersionUpdate` with `Version` and `ReleaseVersion` parameters, plus `LaunchTemplateName` and `LaunchTemplateVersion` when sent. Since the node already runs the control plane's version, only the node group record and the node's `eks.amazonaws.com/nodegroup-image` label change.
+
+```bash
+aws --endpoint-url http://localhost:4566 eks update-cluster-version --name my-cluster --kubernetes-version 1.34
+aws --endpoint-url http://localhost:4566 eks update-nodegroup-config --cluster-name my-cluster \
+  --nodegroup-name workers --labels 'addOrUpdateLabels={team=payments}' \
+  --taints 'addOrUpdateTaints=[{key=dedicated,value=batch,effect=NO_SCHEDULE}]'
+aws --endpoint-url http://localhost:4566 eks list-updates --name my-cluster --nodegroup-name workers
+```
 
 ## Cluster security group
 
@@ -1141,12 +1174,11 @@ eks.tagResource(r -> r
 eks.deleteCluster(r -> r.name("my-cluster"));
 ```
 
-## Not Implemented (Phase 1)
+## Not Implemented
 
 The following EKS features are not yet supported:
 
-- `UpdateClusterConfig` / `UpdateClusterVersion`
-- `UpdateNodegroupConfig` / `UpdateNodegroupVersion`
-- Add-ons (`CreateAddon`, `DescribeAddon`, `ListAddons`)
+- `UpdateClusterConfig` (endpoint access, logging, authentication mode and the other cluster configuration updates)
+- `CancelUpdate`, and `UpdateClusterVersion` rollbacks (`rollbackConfig`)
+- `UpdateAccessEntry` and `ListAccessPolicies`
 - Identity provider configs
-- Access policies

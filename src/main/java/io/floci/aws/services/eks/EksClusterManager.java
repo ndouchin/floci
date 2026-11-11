@@ -96,6 +96,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -1255,6 +1256,37 @@ public class EksClusterManager
             return true;
         }
         return replaceClusterContainer(cluster, previousType);
+    }
+
+    /**
+     * Recreates the cluster's k3s container on the image of the version the cluster now records,
+     * keeping its data volume and API server port. False when the new container could not start and
+     * the previous one was restored.
+     */
+    boolean restartForVersion(Cluster cluster) {
+        if (cluster.getContainerId() == null) {
+            return true;
+        }
+        return replaceClusterContainer(cluster, null);
+    }
+
+    /** The Kubernetes minor version the cluster's API server reports, or empty when it cannot be read. */
+    OptionalInt runningKubernetesMinor(Cluster cluster) {
+        if (cluster.getContainerId() == null) {
+            return OptionalInt.empty();
+        }
+        try {
+            ContainerExec.Result result = execInContainerForResult(cluster.getContainerId(),
+                    new String[]{"kubectl", "get", "--raw", "/version"}, 15);
+            if (result.exitCode() != 0) {
+                return OptionalInt.empty();
+            }
+            String minor = JSON.readTree(result.stdout()).path("minor").asText("").replaceAll("[^0-9]", "");
+            return minor.isEmpty() ? OptionalInt.empty() : OptionalInt.of(Integer.parseInt(minor));
+        } catch (IOException | RuntimeException e) {
+            LOG.debugv("Could not read the Kubernetes version of EKS cluster {0}: {1}", cluster.getName(), e.getMessage());
+            return OptionalInt.empty();
+        }
     }
 
     /**

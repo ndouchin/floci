@@ -3,7 +3,9 @@ package com.floci.test;
 import org.junit.jupiter.api.*;
 import software.amazon.awssdk.services.eks.EksClient;
 import software.amazon.awssdk.services.eks.model.*;
+import software.amazon.awssdk.services.eks.waiters.EksWaiter;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -199,6 +201,30 @@ class EksTest {
         assertThat(response.nodegroup().nodegroupName()).isEqualTo(NODEGROUP);
         assertThat(response.nodegroup().subnets()).contains("subnet-abc");
         assertThat(response.nodegroup().amiType()).isNotNull();
+    }
+
+    @Test
+    @Order(13)
+    void updateNodegroupConfigIsTrackedByDescribeUpdate() {
+        try (EksWaiter waiter = eks.waiter()) {
+            waiter.waitUntilClusterActive(DescribeClusterRequest.builder().name(clusterName).build(),
+                    TestFixtures.waiterOverride(Duration.ofMinutes(3)));
+        }
+        UpdateNodegroupConfigResponse response = eks.updateNodegroupConfig(UpdateNodegroupConfigRequest.builder()
+                .clusterName(clusterName).nodegroupName(NODEGROUP)
+                .labels(UpdateLabelsPayload.builder().addOrUpdateLabels(Map.of("team", "sdk")).build())
+                .scalingConfig(NodegroupScalingConfig.builder().desiredSize(3).build())
+                .build());
+
+        assertThat(response.update().type()).isEqualTo(UpdateType.CONFIG_UPDATE);
+        assertThat(response.update().status()).isEqualTo(UpdateStatus.IN_PROGRESS);
+        assertThat(response.update().params()).extracting(UpdateParam::type)
+                .containsExactly(UpdateParamType.LABELS_TO_ADD, UpdateParamType.DESIRED_SIZE);
+        DescribeUpdateResponse described = eks.describeUpdate(DescribeUpdateRequest.builder()
+                .name(clusterName).updateId(response.update().id()).nodegroupName(NODEGROUP).build());
+        assertThat(described.update().status()).isIn(UpdateStatus.IN_PROGRESS, UpdateStatus.SUCCESSFUL);
+        assertThat(eks.listUpdates(ListUpdatesRequest.builder().name(clusterName).nodegroupName(NODEGROUP).build())
+                .updateIds()).contains(response.update().id());
     }
 
     @Test

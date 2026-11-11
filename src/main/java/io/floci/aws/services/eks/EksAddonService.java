@@ -18,6 +18,7 @@ import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterStatus;
 import io.floci.aws.services.eks.model.CreateAddonRequest;
 import io.floci.aws.services.eks.model.CreatePodIdentityAssociationRequest;
+import io.floci.aws.services.eks.model.ErrorDetail;
 import io.floci.aws.services.eks.model.PodIdentityAssociation;
 import io.floci.aws.services.eks.model.Update;
 import io.floci.aws.services.eks.model.UpdateAddonRequest;
@@ -30,6 +31,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -78,8 +80,15 @@ public class EksAddonService {
     @RegisterForReflection
     public record StoredAddon(Addon addon, String clientRequestToken) {}
 
+    /**
+     * An update to the cluster itself, one of its node groups, or one of its add-ons: at most one of
+     * {@code addonName} and {@code nodegroupName} is set.
+     */
     @RegisterForReflection
-    public record StoredUpdate(Update update, String addonName) {}
+    public record StoredUpdate(Update update, String addonName, String nodegroupName, String clientRequestToken) {}
+
+    @RegisterForReflection
+    public record UpdateIdsPage(List<String> updateIds, String nextToken) {}
 
     @RegisterForReflection
     public record AddonNamesPage(List<String> addons, String nextToken) {}
@@ -289,7 +298,7 @@ public class EksAddonService {
                 now,
                 List.of()
         );
-        updatesStorage.put(prefix(cluster) + update.id(), new StoredUpdate(update, addonName));
+        updatesStorage.put(prefix(cluster) + update.id(), new StoredUpdate(update, addonName, null, null));
         return update;
     }
 
@@ -345,25 +354,116 @@ public class EksAddonService {
     }
 
     public Update describeUpdate(Cluster cluster, String updateId, String addonName) {
+        return describeUpdate(cluster, updateId, addonName, null);
+    }
+
+    /**
+     * The update {@code updateId}, whether or not the request names the add-on or node group it was made
+     * to; naming another one is refused.
+     */
+    public Update describeUpdate(Cluster cluster, String updateId, String addonName, String nodegroupName) {
         StoredUpdate stored = storedUpdate(cluster, updateId);
         if (addonName != null && !addonName.isBlank()
                 && stored.addonName() != null && !stored.addonName().equalsIgnoreCase(addonName.trim())) {
             throw new AwsException("ResourceNotFoundException",
                     "No update: " + updateId + " found for addon: " + addonName, 404);
         }
+        if (nodegroupName != null && !nodegroupName.isBlank()
+                && stored.nodegroupName() != null && !stored.nodegroupName().equals(nodegroupName.trim())) {
+            throw new AwsException("ResourceNotFoundException",
+                    "No update: " + updateId + " found for nodegroup: " + nodegroupName, 404);
+        }
         return stored.update();
     }
 
     /**
-     * The name of the add-on the update {@code updateId} was made to, looked up as {@link #describeUpdate} looks
-     * it up, which returns the update whether or not the request names its add-on.
+     * The update {@code updateId} with what it was made to, looked up as {@link #describeUpdate} looks it
+     * up, which returns the update whether or not the request names its add-on or node group.
      */
-    public String updateAddonName(Cluster cluster, String updateId) {
-        return storedUpdate(cluster, updateId).addonName();
+    public StoredUpdate updateTarget(Cluster cluster, String updateId) {
+        return storedUpdate(cluster, updateId);
+    }
+
+    /**
+     * Records an update to the cluster ({@code nodegroupName} null) or to one of its node groups, so
+     * DescribeUpdate and ListUpdates find it beside the add-on updates.
+     */
+    public synchronized void recordUpdate(Cluster cluster, Update update, String nodegroupName,
+                                          String clientRequestToken) {
+        updatesStorage.put(prefix(cluster) + update.id(),
+                new StoredUpdate(update, null, nodegroupName, clientRequestToken));
+    }
+
+    /** The cluster or node group update an earlier request with the same client token started. */
+    public synchronized Optional<Update> updateForToken(Cluster cluster, String nodegroupName, String token) {
+        if (token == null || token.isBlank()) {
+            return Optional.empty();
+        }
+        String p = prefix(cluster);
+        return updatesStorage.scan(key -> key.startsWith(p)).stream()
+                .filter(stored -> stored.addonName() == null && Objects.equals(nodegroupName, stored.nodegroupName())
+                        && token.equals(stored.clientRequestToken()))
+                .map(StoredUpdate::update).findFirst();
+    }
+
+    /** Moves an update that is still in progress to {@code status}; a finished one is left as it is. */
+    public synchronized void finishUpdate(Cluster cluster, String updateId, String status, List<ErrorDetail> errors) {
+        String key = prefix(cluster) + updateId;
+        updatesStorage.get(key).filter(stored -> "InProgress".equals(stored.update().status())).ifPresent(stored -> {
+            Update current = stored.update();
+            updatesStorage.put(key, new StoredUpdate(new Update(current.id(), status, current.type(), current.params(),
+                    current.createdAt(), errors == null ? List.of() : List.copyOf(errors)),
+                    stored.addonName(), stored.nodegroupName(), stored.clientRequestToken()));
+        });
+    }
+
+    /** The IDs of the cluster's updates still in progress, of the cluster itself or of its node groups. */
+    public synchronized List<String> inProgressUpdateIds(Cluster cluster) {
+        String p = prefix(cluster);
+        return updatesStorage.scan(key -> key.startsWith(p)).stream()
+                .filter(stored -> stored.addonName() == null && "InProgress".equals(stored.update().status()))
+                .map(stored -> stored.update().id()).toList();
+    }
+
+    /**
+     * ListUpdates: the updates of the node group {@code nodegroupName}, of the add-on {@code addonName},
+     * or with neither, of the cluster itself, oldest first.
+     */
+    public UpdateIdsPage listUpdates(Cluster cluster, String nodegroupName, String addonName, Integer maxResults,
+                                     String nextToken) {
+        requireDescribableCluster(cluster);
+        String p = prefix(cluster);
+        boolean byNodegroup = nodegroupName != null && !nodegroupName.isBlank();
+        boolean byAddon = addonName != null && !addonName.isBlank();
+        List<StoredUpdate> updates = updatesStorage.scan(key -> key.startsWith(p)).stream()
+                .filter(stored -> byNodegroup ? nodegroupName.trim().equals(stored.nodegroupName())
+                        : byAddon ? stored.addonName() != null && stored.addonName().equalsIgnoreCase(addonName.trim())
+                        : stored.addonName() == null && stored.nodegroupName() == null)
+                .sorted(Comparator.comparingDouble((StoredUpdate stored) -> stored.update().createdAt())
+                        .thenComparing(stored -> stored.update().id()))
+                .toList();
+        String scope = "updates:" + p + (byNodegroup ? "nodegroup/" + nodegroupName.trim()
+                : byAddon ? "addon/" + addonName.trim().toLowerCase(Locale.ROOT) : "cluster") + "\n";
+        PaginatedResult<StoredUpdate> page = Pagination.paginate(updates, EksAddonService::updateCursor,
+                EksAccessEntryService.pageSize(maxResults), nextToken, scope,
+                token -> new AwsException("InvalidParameterException", "Invalid nextToken", 400));
+        return new UpdateIdsPage(page.items().stream().map(stored -> stored.update().id()).toList(), page.nextToken());
+    }
+
+    private static String updateCursor(StoredUpdate stored) {
+        return String.format(Locale.ROOT, "%020.3f/%s", stored.update().createdAt(), stored.update().id());
+    }
+
+    /** Forgets the updates of a deleted node group, so a node group recreated under its name starts without them. */
+    public synchronized void deleteNodegroupUpdates(Cluster cluster, String nodegroupName) {
+        String p = prefix(cluster);
+        updatesStorage.keys().stream().filter(key -> key.startsWith(p)).toList().forEach(key ->
+                updatesStorage.get(key).filter(stored -> nodegroupName.equals(stored.nodegroupName()))
+                        .ifPresent(stored -> updatesStorage.delete(key)));
     }
 
     private StoredUpdate storedUpdate(Cluster cluster, String updateId) {
-        requireActiveCluster(cluster);
+        requireDescribableCluster(cluster);
         if (updateId == null || updateId.isBlank()) {
             throw new AwsException("InvalidParameterException", "updateId is required", 400);
         }
@@ -509,6 +609,14 @@ public class EksAddonService {
             throw new AwsException("InvalidRequestException",
                     "Cluster must be ACTIVE, but was " + cluster.getStatus(), 400);
         }
+    }
+
+    /** An update stays readable while the cluster it was made to is being updated. */
+    private static void requireDescribableCluster(Cluster cluster) {
+        if (cluster != null && cluster.getStatus() == ClusterStatus.UPDATING) {
+            return;
+        }
+        requireActiveCluster(cluster);
     }
 
     private void validateRoleArn(String roleArn, String fieldName) {

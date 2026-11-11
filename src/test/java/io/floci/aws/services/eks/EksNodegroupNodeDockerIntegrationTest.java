@@ -24,7 +24,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -93,6 +95,27 @@ class EksNodegroupNodeDockerIntegrationTest {
         assertEquals(nodegroupName, label(node, "eks.amazonaws.com/nodegroup"));
         assertEquals("ON_DEMAND", label(node, "eks.amazonaws.com/capacityType"));
         assertEquals("t3.medium", label(node, "node.kubernetes.io/instance-type"));
+
+        String updateId = given().contentType(JSON)
+                .body("""
+                        {"labels": {"addOrUpdateLabels": {"tier": "web"}, "removeLabels": ["team"]},
+                         "taints": {"addOrUpdateTaints": [{"key": "gpu", "effect": "NO_EXECUTE"}],
+                                    "removeTaints": [{"key": "dedicated", "effect": "NO_SCHEDULE"}]}}
+                        """)
+                .when().post("/clusters/" + clusterName + "/node-groups/" + nodegroupName + "/update-config")
+                .then().statusCode(200).extract().path("update.id");
+        node = waitForNode(clusterName, n -> "web".equals(label(n, "tier")) && label(n, "team") == null
+                && hasTaint(n, "gpu", null, "NoExecute") && !hasTaintKey(n, "dedicated"));
+        assertEquals(nodegroupName, label(node, "eks.amazonaws.com/nodegroup"));
+        given().queryParam("nodegroupName", nodegroupName)
+                .when().get("/clusters/" + clusterName + "/updates/" + updateId)
+                .then().statusCode(200).body("update.status", equalTo("Successful"));
+
+        given().when().delete("/clusters/" + clusterName + "/node-groups/" + nodegroupName)
+                .then().statusCode(200);
+        node = waitForNode(clusterName, n -> label(n, "eks.amazonaws.com/nodegroup") == null);
+        assertNull(label(node, "tier"));
+        assertNoTaint(node, "gpu");
     }
 
     private void waitForClusterStatus(String clusterName, ClusterStatus status) throws InterruptedException {

@@ -17,6 +17,9 @@ import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.PodIdentityAssociation;
 import io.floci.aws.services.eks.model.Update;
 import io.floci.aws.services.eks.model.UpdateAddonRequest;
+import io.floci.aws.services.eks.model.UpdateClusterVersionRequest;
+import io.floci.aws.services.eks.model.UpdateNodegroupConfigRequest;
+import io.floci.aws.services.eks.model.UpdateNodegroupVersionRequest;
 import io.floci.aws.services.eks.model.UpdatePodIdentityAssociationRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -304,8 +307,43 @@ public class EksController {
                                    @QueryParam("addonName") String addonName,
                                    @QueryParam("nodegroupName") String nodegroupName) {
         Cluster cluster = eksService.describeCluster(name);
-        Update update = addons.describeUpdate(cluster, updateId, addonName);
+        Update update = addons.describeUpdate(cluster, updateId, addonName, nodegroupName);
         return Response.ok(Map.of("update", update)).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/updates")
+    public Response updateClusterVersion(@PathParam("name") String name, UpdateClusterVersionRequest request) {
+        return Response.ok(Map.of("update", eksService.updateClusterVersion(name, request))).build();
+    }
+
+    @GET
+    @Path("/clusters/{name}/updates")
+    public Response listUpdates(@PathParam("name") String name,
+                                @QueryParam("nodegroupName") String nodegroupName,
+                                @QueryParam("addonName") String addonName,
+                                @QueryParam("maxResults") String maxResults,
+                                @QueryParam("nextToken") String nextToken) {
+        EksAddonService.UpdateIdsPage page = eksService.listUpdates(name, nodegroupName, addonName,
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        return Response.ok(page.nextToken() == null ? Map.of("updateIds", page.updateIds())
+                : Map.of("updateIds", page.updateIds(), "nextToken", page.nextToken())).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/node-groups/{nodegroupName}/update-config")
+    public Response updateNodegroupConfig(@PathParam("name") String name,
+                                          @PathParam("nodegroupName") String nodegroupName,
+                                          UpdateNodegroupConfigRequest request) {
+        return Response.ok(Map.of("update", eksService.updateNodegroupConfig(name, nodegroupName, request))).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/node-groups/{nodegroupName}/update-version")
+    public Response updateNodegroupVersion(@PathParam("name") String name,
+                                           @PathParam("nodegroupName") String nodegroupName,
+                                           UpdateNodegroupVersionRequest request) {
+        return Response.ok(Map.of("update", eksService.updateNodegroupVersion(name, nodegroupName, request))).build();
     }
 
     @DELETE
