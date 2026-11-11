@@ -51,8 +51,8 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.mockito.ArgumentCaptor;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;

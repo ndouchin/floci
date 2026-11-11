@@ -535,10 +535,12 @@ class IamPassRoleEnforcementIntegrationTest {
         cleanup.register(() -> admin("eks").delete(path + "/fargate-profiles/fp"));
 
         // A node access entry passes its role to EC2, whose instances join as it; a standard one passes nothing.
-        String node = "{\"principalArn\":\"" + nodeRole + "\",\"type\":\"EC2_LINUX\"}";
-        user.policy(allow("eks:CreateAccessEntry", "*") + "," + passRole(nodeRole, eks));
+        // The managed node group's role already has the entry EKS made for it, so self-managed nodes get their own.
+        String selfManagedRole = role("eks-self-managed");
+        String node = "{\"principalArn\":\"" + selfManagedRole + "\",\"type\":\"EC2_LINUX\"}";
+        user.policy(allow("eks:CreateAccessEntry", "*") + "," + passRole(selfManagedRole, eks));
         denied(user.rest("eks").body(node).post(path + "/access-entries").then());
-        user.policy(allow("eks:CreateAccessEntry", "*") + "," + passRole(nodeRole, "ec2.amazonaws.com"));
+        user.policy(allow("eks:CreateAccessEntry", "*") + "," + passRole(selfManagedRole, "ec2.amazonaws.com"));
         user.rest("eks").body(node).post(path + "/access-entries").then().statusCode(200);
         user.policy(allow("eks:CreateAccessEntry", "*"));
         user.rest("eks").body("{\"principalArn\":\"" + podRole + "\"}").post(path + "/access-entries").then()

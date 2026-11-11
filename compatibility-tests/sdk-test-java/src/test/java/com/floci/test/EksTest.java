@@ -187,8 +187,24 @@ class EksTest {
         assertThat(response.nodegroup().clusterName()).isEqualTo(clusterName);
         assertThat(response.nodegroup().nodegroupArn())
                 .contains("nodegroup/" + clusterName + "/" + NODEGROUP);
-        assertThat(response.nodegroup().status()).isEqualTo(NodegroupStatus.ACTIVE);
+        // CREATING until its nodes are Ready on a cluster that runs them, as on EKS; ACTIVE at once without one.
+        assertThat(response.nodegroup().status()).isIn(NodegroupStatus.CREATING, NodegroupStatus.ACTIVE);
         assertThat(response.nodegroup().scalingConfig().desiredSize()).isEqualTo(2);
+        waitUntilNodegroupActive(NODEGROUP);
+    }
+
+    private void waitUntilNodegroupActive(String name) {
+        try (EksWaiter waiter = eks.waiter()) {
+            waiter.waitUntilNodegroupActive(DescribeNodegroupRequest.builder().clusterName(clusterName)
+                    .nodegroupName(name).build(), TestFixtures.waiterOverride(Duration.ofMinutes(10)));
+        }
+    }
+
+    private void waitUntilNodegroupDeleted(String name) {
+        try (EksWaiter waiter = eks.waiter()) {
+            waiter.waitUntilNodegroupDeleted(DescribeNodegroupRequest.builder().clusterName(clusterName)
+                    .nodegroupName(name).build(), TestFixtures.waiterOverride(Duration.ofMinutes(10)));
+        }
     }
 
     @Test
@@ -216,6 +232,7 @@ class EksTest {
             waiter.waitUntilClusterActive(DescribeClusterRequest.builder().name(clusterName).build(),
                     TestFixtures.waiterOverride(Duration.ofMinutes(3)));
         }
+        waitUntilNodegroupActive(NODEGROUP);
         UpdateNodegroupConfigResponse response = eks.updateNodegroupConfig(UpdateNodegroupConfigRequest.builder()
                 .clusterName(clusterName).nodegroupName(NODEGROUP)
                 .labels(UpdateLabelsPayload.builder().addOrUpdateLabels(Map.of("team", "sdk")).build())
@@ -255,6 +272,7 @@ class EksTest {
         DeleteNodegroupResponse response = eks.deleteNodegroup(DeleteNodegroupRequest.builder()
                 .clusterName(clusterName).nodegroupName(NODEGROUP).build());
         assertThat(response.nodegroup().status()).isEqualTo(NodegroupStatus.DELETING);
+        waitUntilNodegroupDeleted(NODEGROUP);
     }
 
     @Test
@@ -281,8 +299,9 @@ class EksTest {
         assertThat(createResponse.nodegroup().clusterName()).isEqualTo(clusterName);
         assertThat(createResponse.nodegroup().nodegroupName()).isEqualTo(nodegroupName);
         assertThat(createResponse.nodegroup().nodegroupArn()).contains("nodegroup/" + clusterName + "/" + nodegroupName);
-        assertThat(createResponse.nodegroup().status()).isEqualTo(NodegroupStatus.ACTIVE);
+        assertThat(createResponse.nodegroup().status()).isIn(NodegroupStatus.CREATING, NodegroupStatus.ACTIVE);
         assertThat(createResponse.nodegroup().scalingConfig().desiredSize()).isEqualTo(2);
+        waitUntilNodegroupActive(nodegroupName);
         assertThat(createResponse.nodegroup().labels()).containsEntry("workload", "api");
         assertThat(createResponse.nodegroup().tags()).containsEntry("env", "test");
 
@@ -303,6 +322,7 @@ class EksTest {
                 .nodegroupName(nodegroupName)
                 .build());
         assertThat(deleteResponse.nodegroup().status()).isEqualTo(NodegroupStatus.DELETING);
+        waitUntilNodegroupDeleted(nodegroupName);
         assertThatThrownBy(() -> eks.describeNodegroup(DescribeNodegroupRequest.builder()
                         .clusterName(clusterName)
                         .nodegroupName(nodegroupName)

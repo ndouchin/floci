@@ -50,7 +50,11 @@ class EksResourceTaggingIntegrationTest {
                     .body(Map.of("namespace", "default", "serviceAccount", "sa", "roleArn", roleArn))
                     .post(base + "/pod-identity-associations").then().statusCode(200)
                     .extract().path("association.associationArn"));
-            arns.put("access-entry", eks().contentType("application/json").body(Map.of("principalArn", roleArn))
+            // The node group's role got the access entry EKS creates for it; another principal gets one here.
+            String entryRole = "entry-" + name;
+            createRole(entryRole);
+            arns.put("access-entry", eks().contentType("application/json")
+                    .body(Map.of("principalArn", "arn:aws:iam::" + ACCOUNT + ":role/" + entryRole))
                     .post(base + "/access-entries").then().statusCode(200)
                     .extract().path("accessEntry.accessEntryArn"));
 

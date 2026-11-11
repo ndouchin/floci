@@ -54,7 +54,25 @@ class Ec2InstanceTypeCatalogTest {
                 "m7gd.2xlarge",
                 "m8gd.medium",
                 "m8gd.large",
-                "m8gd.2xlarge"));
+                "m8gd.2xlarge",
+                "t3.large",
+                "t3.xlarge",
+                "t3.2xlarge",
+                "m5.xlarge",
+                "m5.2xlarge",
+                "m5.4xlarge",
+                "c5.large",
+                "c5.xlarge",
+                "m6i.large",
+                "m6i.xlarge",
+                "r5.xlarge",
+                "g4dn.xlarge",
+                "g4dn.2xlarge",
+                "g5.xlarge",
+                "g5.2xlarge",
+                "g5.12xlarge",
+                "g6.xlarge",
+                "g6.2xlarge"));
         for (String family : List.of("c6g", "c6gn", "c7g", "c8g", "m6g", "m7g", "m8g")) {
             for (String size : List.of("medium", "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge")) {
                 expected.add(family + "." + size);
@@ -101,10 +119,10 @@ class Ec2InstanceTypeCatalogTest {
 
     @Test
     void defaultCpuSnapshotDoesNotInventOtherDescribeMetadata() {
-        assertEquals(Optional.of(2), instanceTypeCatalog.defaultVcpus("t3.large"));
+        assertEquals(Optional.of(2), instanceTypeCatalog.defaultVcpus("t3a.large"));
         assertEquals(Optional.of(144), instanceTypeCatalog.defaultVcpus("p6e-gb200.36xlarge"));
         assertEquals(Optional.of(2), instanceTypeCatalog.defaultVcpus("cc1.4xlarge"));
-        assertTrue(instanceTypeCatalog.find("t3.large").isEmpty());
+        assertTrue(instanceTypeCatalog.find("t3a.large").isEmpty());
         assertTrue(instanceTypeCatalog.find("p6e-gb200.36xlarge").isEmpty());
         assertTrue(instanceTypeCatalog.defaultVcpus("m9g.metal-24xl").isEmpty());
         assertTrue(instanceTypeCatalog.defaultVcpus("m9gd.metal-24xl").isEmpty());
