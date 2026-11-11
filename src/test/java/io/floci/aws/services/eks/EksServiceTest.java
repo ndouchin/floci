@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
@@ -23,6 +24,7 @@ import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
+import io.floci.aws.services.eks.model.AccessConfig;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterOidcKey;
@@ -42,6 +44,7 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -69,6 +72,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -2876,5 +2880,75 @@ class EksServiceTest {
         Cluster described = after.describeCluster("restart-args-cluster");
         assertEquals(List.of("--kubelet-arg=max-pods=250"), described.getClusterArgs());
         assertEquals(Map.of("owner", "ops"), described.getTags());
+    }
+
+    @Test
+    void createClusterRecordsTheCallingPrincipalAsCreator() {
+        IamService iam = mock(IamService.class);
+        RequestContext request = new RequestContext();
+        request.setAccessKeyId("ASIADEPLOY");
+        String role = "arn:aws:iam::000000000000:role/ci/deploy";
+        when(iam.resolveCallerArns("ASIADEPLOY")).thenReturn(Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::000000000000:assumed-role/deploy/s", role, IamService.CallerArns.TYPE_ASSUMED_ROLE,
+                "AROADEPLOY:s", null)));
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        EksService service = creatorAwareService(iam, request, entries);
+
+        Cluster cluster = service.createCluster(createTestClusterRequest("creator-cluster"));
+
+        assertEquals(role, cluster.getCreatorArn());
+        verify(entries, never()).bootstrapCreatorEntry(any(), anyString(), any());
+    }
+
+    @Test
+    void unknownKeyMakesTheAccountRootTheCreator() {
+        IamService iam = mock(IamService.class);
+        when(iam.resolveCallerArns(any())).thenReturn(Optional.empty());
+        RequestContext request = new RequestContext();
+        request.setAccessKeyId("test");
+        EksService service = creatorAwareService(iam, request, mock(EksAccessEntryService.class));
+
+        Cluster cluster = service.createCluster(createTestClusterRequest("root-cluster"));
+
+        assertEquals("arn:aws:iam::000000000000:root", cluster.getCreatorArn());
+    }
+
+    @Test
+    void apiModesBootstrapTheCreatorEntryOnlyWhenAsked() {
+        IamService iam = mock(IamService.class);
+        String user = "arn:aws:iam::000000000000:user/admin";
+        when(iam.resolveCallerArns("AKIAADMIN")).thenReturn(Optional.of(new IamService.CallerArns(
+                user, user, IamService.CallerArns.TYPE_USER, "AIDAADMIN", "admin")));
+        RequestContext request = new RequestContext();
+        request.setAccessKeyId("AKIAADMIN");
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        EksService service = creatorAwareService(iam, request, entries);
+
+        CreateClusterRequest bootstrapped = createTestClusterRequest("api-bootstrap");
+        bootstrapped.setAccessConfig(new AccessConfig("API", null));
+        service.createCluster(bootstrapped);
+        CreateClusterRequest withheld = createTestClusterRequest("api-withheld");
+        withheld.setAccessConfig(new AccessConfig("API_AND_CONFIG_MAP", false));
+        service.createCluster(withheld);
+
+        verify(entries, times(1)).bootstrapCreatorEntry(any(), anyString(), any());
+        verify(entries).bootstrapCreatorEntry(any(), eq(user),
+                eq("AIDAADMIN"));
+    }
+
+    @Test
+    void configMapClustersRequireCreatorAdminPermissions() {
+        CreateClusterRequest request = createTestClusterRequest("configmap-no-bootstrap");
+        request.setAccessConfig(new AccessConfig("CONFIG_MAP", false));
+
+        AwsException ex = assertThrows(AwsException.class, () -> eksService.createCluster(request));
+
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    private EksService creatorAwareService(IamService iam, RequestContext request, EksAccessEntryService entries) {
+        return new EksService(storageFactory, testConfig(), regionResolver, null, null,
+                new EksOidcService(storageFactory, new ObjectMapper()), entries,
+                mock(EksPodIdentityAssociationService.class), null, iam, request);
     }
 }

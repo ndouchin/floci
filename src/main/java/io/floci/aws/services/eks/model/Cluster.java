@@ -135,6 +135,18 @@ public class Cluster {
 
     private AccessConfig accessConfig;
 
+    /**
+     * The IAM principal that created the cluster, as aws:PrincipalArn names it (a role session is
+     * its role). Internal persisted metadata omitted from AWS API responses; a record without it
+     * predates realistic cluster authentication.
+     */
+    @JsonProperty("creatorArn")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String creatorArn;
+
+    public String getCreatorArn() { return creatorArn; }
+    public void setCreatorArn(String creatorArn) { this.creatorArn = creatorArn; }
+
     public AccessConfig getAccessConfig() { return accessConfig; }
     public void setAccessConfig(AccessConfig accessConfig) { this.accessConfig = accessConfig; }
 
@@ -266,6 +278,7 @@ public class Cluster {
         c.defaultStorageClass = this.defaultStorageClass;
         c.joinedInstanceIds = this.joinedInstanceIds != null ? new ConcurrentHashMap<>(this.joinedInstanceIds) : null;
         c.accessConfig = this.accessConfig;
+        c.creatorArn = this.creatorArn;
         return c;
     }
 }

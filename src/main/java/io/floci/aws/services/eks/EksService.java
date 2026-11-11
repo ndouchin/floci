@@ -7,6 +7,7 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.core.common.TagHandler;
@@ -48,6 +49,9 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.iam.IamService;
+import io.quarkus.arc.Arc;
+import io.quarkus.arc.ArcContainer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -108,6 +112,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final IamService iamService;
+    private final RequestContext requestContext;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
     private final Map<String, UserDataClaim> appliedClusterUserData = new ConcurrentHashMap<>();
     private final Map<String, Object> nodeGroupCapacityLocks = new ConcurrentHashMap<>();
@@ -121,7 +127,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations,
-            EksAddonService addons) {
+            EksAddonService addons, IamService iamService, RequestContext requestContext) {
         this.storage = storageFactory.create("eks", "eks-clusters.json",
                 new TypeReference<Map<String, Cluster>>() {
                 });
@@ -139,9 +145,20 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.iamService = iamService;
+        this.requestContext = requestContext;
         if (this.clusterManager != null) {
             this.clusterManager.setEc2Service(this.ec2Service);
         }
+    }
+
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+            RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
+            EksOidcService oidcService, EksAccessEntryService accessEntries,
+            EksPodIdentityAssociationService podIdentityAssociations,
+            EksAddonService addons) {
+        this(storageFactory, config, regionResolver, clusterManager, ec2Service,
+                oidcService, accessEntries, podIdentityAssociations, addons, null, null);
     }
 
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -630,14 +647,21 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         AccessConfig accessConfig = new AccessConfig(authenticationMode,
                 requestedAccess == null || requestedAccess.bootstrapClusterCreatorAdminPermissions() == null
                         || requestedAccess.bootstrapClusterCreatorAdminPermissions());
+        if ("CONFIG_MAP".equals(authenticationMode) && !accessConfig.bootstrapClusterCreatorAdminPermissions()) {
+            throw new AwsException("InvalidParameterException",
+                    "bootstrapClusterCreatorAdminPermissions must be true if cluster authentication mode is set to CONFIG_MAP",
+                    400);
+        }
         String region = regionResolver.getRegion();
         String resolvedVpcId = validateSubnetsAndResolveVpcId(region, request.getResourcesVpcConfig());
         String accountId = regionResolver.getAccountId();
         String arn = AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + name).toString();
+        IamService.CallerArns creator = resolveCreator(accountId);
 
         Cluster cluster = new Cluster();
         cluster.setName(name);
         cluster.setAccessConfig(accessConfig);
+        cluster.setCreatorArn(creator == null ? null : creator.principalArn());
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
@@ -721,6 +745,11 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
 
             storage.put(name, cluster);
+            if (creator != null && AwsArnUtils.isArnFor(creator.principalArn(), "iam")
+                    && !"CONFIG_MAP".equals(authenticationMode)
+                    && accessConfig.bootstrapClusterCreatorAdminPermissions()) {
+                accessEntries.bootstrapCreatorEntry(cluster, creator.principalArn(), creator.userId());
+            }
         } catch (RuntimeException e) {
             if (clusterSg != null) {
                 try {
@@ -734,6 +763,24 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
 
         return cluster;
+    }
+
+    /**
+     * The IAM principal making this CreateCluster call, as GetCallerIdentity reports it, the account
+     * root for a key IAM does not know. Null outside a request or without IAM, which leaves the
+     * cluster on the authentication clusters created before the creator was recorded keep.
+     */
+    private IamService.CallerArns resolveCreator(String accountId) {
+        if (iamService == null || requestContext == null) {
+            return null;
+        }
+        ArcContainer container = Arc.container();
+        if (container != null && container.isRunning() && !container.requestContext().isActive()) {
+            return null;
+        }
+        String root = regionResolver.buildGlobalArn("iam", accountId, "root");
+        return iamService.resolveCallerArns(requestContext.getAccessKeyId())
+                .orElseGet(() -> IamService.CallerArns.accountRoot(root, accountId));
     }
 
     /**
@@ -1781,6 +1828,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         } else {
                             LOG.infov("EKS cluster {0} is now ACTIVE", cluster.getName());
                         }
+                        reconcileAccessPoliciesAsync(cluster);
                         restoreJoinedInstancesAsync(entry.accountId(), cluster);
                     }
                 } else if (cluster.getStatus() == ClusterStatus.ACTIVE && hasPendingJoinedInstances(cluster)) {
@@ -1789,6 +1837,18 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
         } catch (Exception e) {
             LOG.error("Error in EKS readiness poller", e);
+        }
+    }
+
+    private void reconcileAccessPoliciesAsync(Cluster cluster) {
+        boolean accessEntriesEnabled = cluster.getAccessConfig() != null
+                && !"CONFIG_MAP".equals(cluster.getAccessConfig().authenticationMode());
+        if (accessEntries != null && cluster.getCreatorArn() != null && accessEntriesEnabled) {
+            CompletableFuture.runAsync(() -> accessEntries.reconcileBindings(cluster))
+                    .exceptionally(e -> {
+                        LOG.warnv(e, "Could not apply the access policies of EKS cluster {0} as RBAC", cluster.getName());
+                        return null;
+                    });
         }
     }
 

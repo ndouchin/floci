@@ -37,13 +37,17 @@ import java.util.function.UnaryOperator;
 /** Access-entry and access-policy management metadata; Kubernetes authorization is handled separately. */
 @ApplicationScoped
 public class EksAccessEntryService {
+    static final String CLUSTER_ADMIN_POLICY = "AmazonEKSClusterAdminPolicy";
+
     private final StorageBackend<String, StoredEntry> entries;
     private final IamService iam;
     private final Clock clock;
+    private final EksAccessPolicyBindings bindings;
 
     @Inject
-    public EksAccessEntryService(StorageFactory factory, IamService iam) {
-        this(factory.create("eks", "eks-access-entries.json", new TypeReference<Map<String, StoredEntry>>() {}), iam);
+    public EksAccessEntryService(StorageFactory factory, IamService iam, EksAccessPolicyBindings bindings) {
+        this(factory.create("eks", "eks-access-entries.json", new TypeReference<Map<String, StoredEntry>>() {}), iam,
+                Clock.systemUTC(), bindings);
     }
 
     EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam) {
@@ -51,9 +55,15 @@ public class EksAccessEntryService {
     }
 
     EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam, Clock clock) {
+        this(entries, iam, clock, null);
+    }
+
+    EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam, Clock clock,
+                          EksAccessPolicyBindings bindings) {
         this.entries = entries;
         this.iam = iam;
         this.clock = clock;
+        this.bindings = bindings;
     }
 
     @RegisterForReflection
@@ -70,8 +80,14 @@ public class EksAccessEntryService {
     @RegisterForReflection
     public record PolicyPage(List<AssociatedAccessPolicy> associatedAccessPolicies, String nextToken) {}
 
-    public synchronized AssociatedAccessPolicy associate(Cluster cluster, String principal,
-                                                         AssociateAccessPolicyRequest request) {
+    public AssociatedAccessPolicy associate(Cluster cluster, String principal, AssociateAccessPolicyRequest request) {
+        AssociatedAccessPolicy association = storeAssociation(cluster, principal, request);
+        reconcileBindings(cluster);
+        return association;
+    }
+
+    private synchronized AssociatedAccessPolicy storeAssociation(Cluster cluster, String principal,
+                                                                 AssociateAccessPolicyRequest request) {
         StoredEntry stored = storedEntry(cluster, principal);
         if (request == null || request.policyArn() == null) {
             throw invalid("policyArn is required");
@@ -106,16 +122,23 @@ public class EksAccessEntryService {
         return new PolicyPage(page.items(), page.nextToken());
     }
 
-    public synchronized void disassociate(Cluster cluster, String principal, String policyArn) {
+    public void disassociate(Cluster cluster, String principal, String policyArn) {
+        if (removeAssociation(cluster, principal, policyArn)) {
+            reconcileBindings(cluster);
+        }
+    }
+
+    private synchronized boolean removeAssociation(Cluster cluster, String principal, String policyArn) {
         StoredEntry stored = storedEntry(cluster, principal);
         requireAccessPolicyArn(cluster, policyArn);
         List<AssociatedAccessPolicy> policies = stored.accessPolicies().stream()
                 .filter(existing -> !existing.policyArn().equals(policyArn)).toList();
         if (policies.size() == stored.accessPolicies().size()) {
-            return; // EKS documents no error for a policy the entry does not hold
+            return false; // EKS documents no error for a policy the entry does not hold
         }
         entries.put(prefix(cluster) + principal, new StoredEntry(stored.entry(), stored.principalId(),
                 stored.clientRequestToken(), policies));
+        return true;
     }
 
     private StoredEntry storedEntry(Cluster cluster, String principal) {
@@ -245,9 +268,89 @@ public class EksAccessEntryService {
         return storedEntry(cluster, principal).entry();
     }
 
-    public synchronized void delete(Cluster cluster, String principal) {
-        describe(cluster, principal);
+    public void delete(Cluster cluster, String principal) {
+        if (!removeEntry(cluster, principal).accessPolicies().isEmpty()) {
+            reconcileBindings(cluster);
+        }
+    }
+
+    private synchronized StoredEntry removeEntry(Cluster cluster, String principal) {
+        StoredEntry stored = storedEntry(cluster, principal);
         entries.delete(prefix(cluster) + principal);
+        return stored;
+    }
+
+    /**
+     * Records the access entry EKS gives the IAM principal that created the cluster when
+     * {@code bootstrapClusterCreatorAdminPermissions} is true in an {@code API} or
+     * {@code API_AND_CONFIG_MAP} cluster: a STANDARD entry with {@value #CLUSTER_ADMIN_POLICY} at
+     * cluster scope. It is an ordinary entry, so deleting it or disassociating the policy revokes the
+     * creator's access, as in EKS. Written while the cluster is still CREATING; its RBAC binding is
+     * applied once the API server answers.
+     */
+    public synchronized void bootstrapCreatorEntry(Cluster cluster, String principalArn, String callerUserId) {
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        AwsArnUtils.Arn principal = AwsArnUtils.parse(principalArn);
+        String resource = principal.resource();
+        boolean role = resource.startsWith("role/");
+        String name = resource.substring(resource.lastIndexOf('/') + 1);
+        String principalId = role
+                ? iam.findRole(principal.accountId(), name).filter(value -> principalArn.equals(value.getArn()))
+                        .map(IamRole::getRoleId).orElse(null)
+                : resource.startsWith("user/")
+                ? iam.findUser(principal.accountId(), name).filter(value -> principalArn.equals(value.getArn()))
+                        .map(IamUser::getUserId).orElse(null)
+                : principal.accountId();
+        if (principalId == null && callerUserId != null) {
+            principalId = callerUserId.contains(":") ? callerUserId.substring(0, callerUserId.indexOf(':')) : callerUserId;
+        }
+        String username = role ? AwsArnUtils.Arn.global(principal.partition(), "sts", principal.accountId(),
+                "assumed-role/" + name + "/{{SessionName}}").toString() : principalArn;
+        double now = EpochSeconds.fromMillis(clock.millis());
+        String entryArn = new AwsArnUtils.Arn(clusterArn.partition(), "eks", clusterArn.region(), clusterArn.accountId(),
+                "access-entry/" + cluster.getName() + "/" + (role ? "role" : "user") + "/" + principal.accountId() + "/"
+                        + name + "/" + UUID.randomUUID()).toString();
+        AccessEntry entry = new AccessEntry(entryArn, cluster.getName(), principalArn, "STANDARD", username,
+                List.of(), Map.of(), now, now);
+        String policyArn = new AwsArnUtils.Arn(clusterArn.partition(), "eks", "",
+                "aws", "cluster-access-policy/" + CLUSTER_ADMIN_POLICY).toString(); // partition-literal: the AWS-managed account, "aws" in every partition
+        AssociatedAccessPolicy policy = new AssociatedAccessPolicy(policyArn,
+                new AccessScope("cluster", List.of()), now, now);
+        entries.put(prefix(cluster) + principalArn, new StoredEntry(entry, principalId, null, List.of(policy)));
+    }
+
+    /**
+     * The access entry a verified IAM principal authenticates through: the entry for exactly that
+     * principal ARN (a role session is its role, path included), still bound to the principal ID it
+     * was created for, so a principal deleted and recreated under the same name no longer matches.
+     * {@code callerUserId} is the caller's aws:userid, whose part before a colon is a role's ID.
+     */
+    synchronized Optional<StoredEntry> entryFor(Cluster cluster, String accountId, String principalArn,
+                                                String callerUserId) {
+        String key = prefix(cluster) + principalArn;
+        Optional<StoredEntry> stored = entries instanceof AccountAwareStorageBackend<StoredEntry> aware
+                ? aware.getForAccount(accountId, key) : entries.get(key);
+        String callerPrincipalId = callerUserId == null ? null
+                : callerUserId.contains(":") ? callerUserId.substring(0, callerUserId.indexOf(':')) : callerUserId;
+        return stored.filter(value -> value.principalId() != null && value.principalId().equals(callerPrincipalId));
+    }
+
+    /** Every STANDARD entry of the cluster in the account that owns it, for the RBAC its policies grant. */
+    synchronized List<StoredEntry> standardEntries(Cluster cluster, String accountId) {
+        String prefix = prefix(cluster);
+        List<StoredEntry> stored = entries instanceof AccountAwareStorageBackend<StoredEntry> aware
+                ? aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
+                        .filter(entry -> accountId == null || accountId.equals(entry.accountId()))
+                        .map(AccountAwareStorageBackend.AccountEntry::value).toList()
+                : entries.scan(key -> key.startsWith(prefix));
+        return stored.stream().filter(value -> "STANDARD".equals(value.entry().type())).toList();
+    }
+
+    /** Applies the cluster's access policies as Kubernetes RBAC, now that its API server answers. */
+    public void reconcileBindings(Cluster cluster) {
+        if (bindings != null) {
+            bindings.reconcile(cluster, standardEntries(cluster, cluster.getAccountId()));
+        }
     }
 
     public synchronized Page list(Cluster cluster, Integer maxResults, String nextToken) {

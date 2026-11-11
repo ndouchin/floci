@@ -110,7 +110,7 @@ public class EksController {
     private Cluster toClusterResponse(Cluster cluster) {
         if (cluster == null || (!cluster.isExplicitVersion() && cluster.getNodeInstanceType() == null
                 && cluster.getClusterArgs() == null && cluster.getDefaultStorageClass() == null
-                && cluster.getJoinedInstanceIds() == null)) {
+                && cluster.getJoinedInstanceIds() == null && cluster.getCreatorArn() == null)) {
             return cluster;
         }
         Cluster response = cluster.copy();
@@ -119,6 +119,7 @@ public class EksController {
         response.setClusterArgs(null);
         response.setDefaultStorageClass(null);
         response.setJoinedInstanceIds(null);
+        response.setCreatorArn(null);
         return response;
     }
 
