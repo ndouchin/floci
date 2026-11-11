@@ -369,7 +369,7 @@ For operation-level compatibility, see the [Services Overview](https://floci.io/
 | Bedrock | In-process | Guardrail lifecycle, versions, and tags, plus a seeded foundation model and inference profile catalog, on the control plane |
 | Bedrock Runtime | In-process stub | Dummy Converse and InvokeModel responses for local development |
 | Bedrock AgentCore | In-process stub | Stateful control plane (agent runtimes, gateways, memory, workload identity); canned InvokeAgentRuntime responses |
-| EKS | Real Docker, mock mode available | k3s clusters with live Kubernetes API server, IAM authentication through the cluster creator, access entries and aws-auth, cluster and node group version and config updates |
+| EKS | Real Docker, mock mode available | k3s clusters with live Kubernetes API server, one k3s agent per managed node group node (VPC addresses, EKS node names and labels, scaling, rolling version updates), IAM authentication through the cluster creator, access entries and aws-auth, cluster and node group version and config updates |
 | MWAA | Real Docker, mock mode available | Real Apache Airflow (LocalExecutor) + Postgres metadata DB per environment; web/CLI proxy; S3-backed DAG sync |
 | ELB v2 | In-process | ALB, NLB, target groups, listeners, routing rules, Lambda targets, tags |
 | CodeBuild | In-process with real Docker | Real buildspec execution, CloudWatch logs, S3 artifacts |

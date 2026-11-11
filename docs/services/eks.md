@@ -169,7 +169,7 @@ Real EKS sets neither endpoint variable. Floci adds them so the credentials it h
 
 ### Credential endpoint
 
-Floci serves pod identity credentials through a link-local relay bound to `169.254.170.23:80` inside the cluster container, forwarding requests to Floci's credentials endpoint (`GET /v1/credentials`). Workloads reach this endpoint using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
+Floci serves pod identity credentials through a link-local relay bound to `169.254.170.23:80` inside each node's container, forwarding requests to Floci's credentials endpoint (`GET /v1/credentials`). Workloads reach this endpoint using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
 
 The credentials endpoint performs the following validations:
 1. Validates token format and extracts the issuer URL without verifying signatures yet.
@@ -225,17 +225,19 @@ Deleting a cluster that still has managed node groups or Fargate profiles fails 
 
 [`UpdateClusterVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateClusterVersion.html) accepts the next minor version only. Any other version, including the current one and older ones, is refused with `InvalidParameterException` and the message EKS returns, `Unsupported Kubernetes minor version update from 1.33 to 1.35` (as reported in [rancher/rancher#41643](https://github.com/rancher/rancher/issues/41643); AWS does not document the message). As the API reference requires, every managed node group must run the cluster's current version first; otherwise the call fails with `InvalidRequestException` and `Nodegroups <names> must be updated to match cluster version <version> before updating cluster version`, the message seen in [terraform-provider-aws#19478](https://github.com/hashicorp/terraform-provider-aws/issues/19478) (the error code is not shown there; `InvalidRequestException` is Floci's reading of "the request is invalid given the state of the cluster"). `force` overrides nothing. A cluster that is not `ACTIVE`, or whose node is being replaced, answers `ResourceInUseException`.
 
-The update reports `Version` and `PlatformVersion` (`eks.1`) parameters, as in the API reference example. The cluster is `UPDATING` while Floci recreates its k3s container on the image of the new version, keeping the named data volume, so workloads and objects survive, and the published API port and certificate authority, so kubeconfigs stay valid. It returns to `ACTIVE` once the new API server answers `/readyz`, with `version` and `platformVersion` updated and the update `Successful`. If the new container cannot start, Floci restores the previous one and the update is `Failed`. Node group versions do not change: in EKS the nodes keep their kubelet until `UpdateNodegroupVersion`, but Floci's only node is the server's own kubelet, which runs the new version at once.
+The update reports `Version` and `PlatformVersion` (`eks.1`) parameters, as in the API reference example. The cluster is `UPDATING` while Floci recreates its k3s container on the image of the new version, keeping the named data volume, so workloads and objects survive, and the published API port and certificate authority, so kubeconfigs stay valid. It returns to `ACTIVE` once the new API server answers `/readyz`, with `version` and `platformVersion` updated and the update `Successful`. If the new container cannot start, Floci restores the previous one and the update is `Failed`. Only the server is recreated: the nodes keep running and reconnect to it, and they keep their kubelet version until their node group is updated, as managed nodes do on EKS ([update a cluster](https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html)); no node work runs while the server is replaced, and nodes may read `NotReady` for a few seconds meanwhile. A [cluster created before managed nodes](#single-shared-node-of-earlier-clusters) has one node, the server's own kubelet, which runs the new version at once.
 
 A cluster created without `version` runs the configured default image (`rancher/k3s:latest`) while reporting 1.29. Recreating it on an older minor than that image runs would downgrade its data, which k3s does not support, so Floci refuses such an update with `InvalidRequestException`; create the cluster with an explicit version to update it.
 
 ### Node group configuration
 
-[`UpdateNodegroupConfig`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupConfig.html) applies `labels` (`addOrUpdateLabels`, `removeLabels`), `taints` (`addOrUpdateTaints`, `removeTaints`, a taint being identified by its key and effect), `scalingConfig` (only the members sent change), `updateConfig`, `nodeRepairConfig` and `warmPoolConfig`. The update has type `ConfigUpdate` and one parameter per change: `MinSize`, `MaxSize` and `DesiredSize` as in the API reference example, `LabelsToAdd`, `LabelsToRemove`, `TaintsToAdd` and `TaintsToRemove` as JSON (the encoding of these four values is not documented by AWS and is Floci's choice), and `MaxUnavailable`, `MaxUnavailablePercentage`, `UpdateStrategy`, `NodeRepairEnabled` and the `WarmPool*` parameters. The node group is `UPDATING` until the change is stored and, for the first node group, its labels and taints are on the running node (see [Timing and post-start nodegroups](#timing-and-post-start-nodegroups)). Floci refuses with `InvalidParameterException` a label both added and removed, a taint without a key or with an effect other than `NO_SCHEDULE`, `NO_EXECUTE` or `PREFER_NO_SCHEDULE`, more than 50 taints, a scaling configuration that breaks `0 <= minSize <= desiredSize <= maxSize` with `maxSize >= 1`, and a request that changes nothing; these messages are Floci's. A node group or cluster that is not `ACTIVE` answers `ResourceInUseException`. `desiredSize` is recorded but does not add nodes: a cluster has one node.
+[`UpdateNodegroupConfig`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupConfig.html) applies `labels` (`addOrUpdateLabels`, `removeLabels`), `taints` (`addOrUpdateTaints`, `removeTaints`, a taint being identified by its key and effect), `scalingConfig` (only the members sent change), `updateConfig`, `nodeRepairConfig` and `warmPoolConfig`. The update has type `ConfigUpdate` and one parameter per change: `MinSize`, `MaxSize` and `DesiredSize` as in the API reference example, `LabelsToAdd`, `LabelsToRemove`, `TaintsToAdd` and `TaintsToRemove` as JSON (the encoding of these four values is not documented by AWS and is Floci's choice), and `MaxUnavailable`, `MaxUnavailablePercentage`, `UpdateStrategy`, `NodeRepairEnabled` and the `WarmPool*` parameters. The node group is `UPDATING` until it has its new number of nodes, each Ready and carrying the new labels and taints (see [Labels and taints after registration](#labels-and-taints-after-registration)). Floci refuses with `InvalidParameterException` a label both added and removed, a taint without a key or with an effect other than `NO_SCHEDULE`, `NO_EXECUTE` or `PREFER_NO_SCHEDULE`, more than 50 taints, a scaling configuration that breaks `0 <= minSize <= desiredSize <= maxSize` with `maxSize >= 1`, and a request that changes nothing; these messages are Floci's. A node group or cluster that is not `ACTIVE` answers `ResourceInUseException`. A new `desiredSize` launches nodes, or terminates the newest ones without draining them, as EKS scaling ignores PodDisruptionBudgets ([update managed node group](https://docs.aws.amazon.com/eks/latest/userguide/update-managed-node-group.html)); see [Managed nodes](#managed-nodes) for the node cap.
 
 ### Node group version
 
-[`UpdateNodegroupVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupVersion.html) moves a node group to `version`, by default the cluster's version, and `releaseVersion`, by default `<version>-eks-1`. A version newer than the cluster's, or older than the node group's ("You cannot roll back a node group to an earlier Kubernetes version"), is refused with `InvalidParameterException`. A `launchTemplate` is accepted only for a node group created with one and must name the same template ID or name, as the API reference requires; its version is resolved in EC2. The update has type `VersionUpdate` with `Version` and `ReleaseVersion` parameters, plus `LaunchTemplateName` and `LaunchTemplateVersion` when sent. Since the node already runs the control plane's version, only the node group record and the node's `eks.amazonaws.com/nodegroup-image` label change.
+[`UpdateNodegroupVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupVersion.html) moves a node group to `version`, by default the cluster's version, and `releaseVersion`, by default the release Floci reports for that version (see [Scalar and collection inputs](#scalar-and-collection-inputs)). A version newer than the cluster's, or older than the node group's ("You cannot roll back a node group to an earlier Kubernetes version"), is refused with `InvalidParameterException`; the EKS user guide now describes rolling back, but the API reference refuses it, and Floci follows the API reference. A `launchTemplate` is accepted only for a node group created with one and must name the same template ID or name, as the API reference requires; its version is resolved in EC2. The update has type `VersionUpdate` with `Version` and `ReleaseVersion` parameters, plus `LaunchTemplateName` and `LaunchTemplateVersion` when sent.
+
+The node group is `UPDATING` while Floci replaces its nodes as EKS's default update strategy does ([managed node update behavior](https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html)): per batch of `updateConfig.maxUnavailable` nodes (1 by default; `maxUnavailablePercentage` of the nodes, at least one), it launches a replacement on the new version (a new instance, so a new ID, address and name), waits for it to be Ready, then labels the old node `node.kubernetes.io/exclude-from-external-load-balancers=true`, cordons it and drains it (`kubectl drain --ignore-daemonsets --delete-emptydir-data --force`), and terminates it. A drain that does not finish within `floci.services.eks.node-drain-timeout-seconds` (default 900, EKS's 15 minutes) fails the update with a `PodEvictionFailure` error and health issue, uncordons the old node and terminates the surplus replacement, unless the update was sent with `force`, which terminates the node anyway. With no free node under the [node cap](#managed-nodes) to launch a replacement first, Floci terminates each node before launching its replacement, as EKS's minimal strategy does, and logs it. The update is `Successful`, and the node group reports its new `version` and `releaseVersion`, once every node runs the new version. A [cluster created before managed nodes](#single-shared-node-of-earlier-clusters) only updates the record and its node's image label, since its node runs the control plane's version.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks update-cluster-version --name my-cluster --kubernetes-version 1.34
@@ -402,7 +404,7 @@ EKS clusters support configuring KMS envelope encryption for secrets and control
 
 ### Scalar and collection inputs
 
-`nodegroupName`, `nodeRole`, `subnets`, `version`, `releaseVersion`, `amiType`, `capacityType`, `diskSize`, `instanceTypes`, `scalingConfig`, `labels`, `tags`, and `clientRequestToken`. Several of these receive an AWS-shaped default when omitted: `capacityType` becomes `ON_DEMAND`, `amiType` becomes `AL2_x86_64`, `diskSize` becomes `20`, `instanceTypes` becomes `["t3.medium"]`, `version` is inherited from the cluster, and `releaseVersion` becomes `<version>-eks-1`.
+`nodegroupName`, `nodeRole`, `subnets`, `version`, `releaseVersion`, `amiType`, `capacityType`, `diskSize`, `instanceTypes`, `scalingConfig`, `labels`, `tags`, and `clientRequestToken`. Several of these receive an AWS-shaped default when omitted: `capacityType` becomes `ON_DEMAND`, `diskSize` becomes `20` and `instanceTypes` becomes `["t3.medium"]` ([`CreateNodegroup`](https://docs.aws.amazon.com/eks/latest/APIReference/API_CreateNodegroup.html)), and `version` is inherited from the cluster, which is also "the only accepted specified value": another version is refused with `InvalidParameterException`. `amiType` becomes `AL2023_x86_64_STANDARD` from Kubernetes 1.30, since new managed node groups default to Amazon Linux 2023 from that version ([Amazon Linux 2023](https://docs.aws.amazon.com/eks/latest/userguide/al2023.html)), and `AL2_x86_64` before; `ARM_64` variants for Graviton instance types, the `NVIDIA` (1.30 and later) or `AL2_x86_64_GPU` variant for GPU instance types (the GPU default is not documented and is Floci's choice), and `CUSTOM` when the launch template names an AMI. `releaseVersion` takes the EKS AMI release form `<major>.<minor>.<patch>-<date>` ([Amazon Linux AMI versions](https://docs.aws.amazon.com/eks/latest/userguide/eks-linux-ami-versions.html)), the patch being the k3s release Floci runs for that minor and the date a fixed `20251023`, for example `1.33.1-20251023`.
 
 ### Structured inputs
 
@@ -435,42 +437,32 @@ EKS clusters support configuring KMS envelope encryption for secrets and control
 
 ### Launch template user data execution
 
-When a node group specifies a `launchTemplate`, Floci resolves the launch template from EC2 (by ID or name, and version) and executes any provided user data inside the cluster's running k3s container. If the referenced launch template carries no user data, execution is skipped.
+When a node group specifies a `launchTemplate`, Floci resolves it from EC2 (by ID or name, and version) and runs its user data in each node it launches, as EC2 runs user data on each instance, once the node's agent has started (`docker exec`; the k3s image has busybox `sh`). A launch template without user data runs nothing.
 
-- **Execution target**: Floci runs one k3s container per cluster. Launch template user data executes inside this cluster container via `docker exec`.
-- **Single-container mapping rule**:
-  - The first node group specifying user data executes its scripts in the container.
-  - Subsequent node groups on the same cluster with identical user data skip execution as a no-op.
-  - Subsequent node groups on the same cluster with differing user data log a warning and skip execution without failing the node group.
-- **Timing and tradeoffs**: User data runs post-start when `CreateNodegroup` is invoked. Because the k3s process is already running, bootstrap configurations requiring pre-kubelet drop-ins (such as `/etc/rancher/k3s/config.yaml`) cannot be reloaded dynamically without restarting the container.
-- **Failure handling**: If any user data script exits with a non-zero status or times out (30-minute limit), the node group status is set to `CREATE_FAILED` and `health.issues` is populated with code `NodeCreationFailure`, the failure message, and the node group name in `resourceIds`.
-- **Differences from EC2**: Scripts run inside the existing shared k3s container rather than an isolated VM instance. Other launch template settings (AMI, instance type, block device mappings, network interfaces) remain metadata-only and do not alter container provisioning.
+- **Containerd host configuration**: `/etc/containerd/certs.d` in each node is a link to k3s's containerd certs directory, set before the agent starts, so user data that writes registry host configurations there works unchanged and survives a restart of the node ([Registry host configuration](#registry-host-configuration-pull-through-caches-and-custom-mirrors)).
+- **Timing and tradeoffs**: because k3s is already running when the script runs, settings that need a kubelet restart (such as `/etc/rancher/k3s/config.yaml`) take no effect.
+- **Failure handling**: a script that exits with a non-zero status or times out (30-minute limit) keeps the node from counting as launched, and the node group becomes `CREATE_FAILED` with a `NodeCreationFailure` issue carrying the failure message.
+- **Differences from EC2**: other launch template settings (instance type, block device mappings, network interfaces) remain metadata; the AMI only sets the `nodegroup-image` label, and `PrivateDnsNameOptions.HostnameType` the node's name.
 
 ### Nodegroup labels, taints and capacity type
 
-When managed nodegroups are defined for a cluster, Floci applies their labels and taints to the Kubernetes worker node at startup via `--kubelet-arg` flags, and through the Kubernetes API once the node is running (see [Timing and post-start nodegroups](#timing-and-post-start-nodegroups)).
+Each node registers with its node group's labels and taints (k3s `--node-label` and `--node-taint`), and Floci keeps them current through the Kubernetes API afterwards.
 
 #### Applied labels
-Floci configures `--kubelet-arg=node-labels=...` with the following entries:
-- Standard topology labels: `topology.kubernetes.io/region` and `topology.kubernetes.io/zone`.
-- Instance type: `node.kubernetes.io/instance-type` (sourced from the nodegroup's first configured instance type, or defaulting to `m5.large`).
-- EKS system labels:
+- Topology: `topology.kubernetes.io/region`, `topology.kubernetes.io/zone` (the zone of the node's subnet) and `topology.k8s.aws/zone-id` (its zone ID, which the AWS cloud controller manager sets, [`well_known_labels.go`](https://github.com/kubernetes/cloud-provider-aws/blob/3774b6407a490818c9f5cb0ad4fef2ac562fa299/pkg/providers/v1/well_known_labels.go#L19-L27)).
+- Instance type: `node.kubernetes.io/instance-type`, and `beta.kubernetes.io/instance-type` with the same value, from the node group's first `instanceTypes` entry, whatever the catalog holds.
+- EKS labels, as listed in [Target AI/ML workloads to specific nodes with labels](https://docs.aws.amazon.com/eks/latest/userguide/ml-workload-placement.html):
   - `eks.amazonaws.com/nodegroup=<nodegroupName>`
-  - `eks.amazonaws.com/capacityType=<ON_DEMAND|SPOT|CAPACITY_BLOCK>` (defaults to `ON_DEMAND` when omitted)
-  - `eks.amazonaws.com/nodegroup-image=<imageId>` (sourced from `releaseVersion`, launch template AMI, or defaulting to `ami-eks-k3s`)
-- User-defined labels: all key-value pairs specified in the nodegroup's `labels` map, excluding reserved system keys (`topology.kubernetes.io/*`, `eks.amazonaws.com/*`, and `node.kubernetes.io/instance-type`).
+  - `eks.amazonaws.com/capacityType=<ON_DEMAND|SPOT|CAPACITY_BLOCK>` (`ON_DEMAND` when omitted)
+  - `eks.amazonaws.com/nodegroup-image=<AMI ID>`: the launch template's image when it names one, else the EKS optimized AMI of the AMI type and version that Floci's EC2 image catalog publishes under `/aws/service/eks/optimized-ami/<version>/...` ([retrieve an AMI ID](https://docs.aws.amazon.com/eks/latest/userguide/retrieve-ami-id.html)). The catalog publishes Amazon Linux 2023 and Amazon Linux 2 AMIs; any other AMI type, and Amazon Linux 2 past 1.32, take the Amazon Linux 2023 AMI of the same architecture.
+  - `eks.amazonaws.com/sourceLaunchTemplateId` and `eks.amazonaws.com/sourceLaunchTemplateVersion`, only for a node group created with a launch template.
+- User-defined labels: the node group's `labels`, excluding the keys EKS keeps (`topology.kubernetes.io/*`, `eks.amazonaws.com/*`, `node.kubernetes.io/instance-type`). A label in the `kubernetes.io` or `k8s.io` namespaces that [NodeRestriction](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#noderestriction) does not let a kubelet set on itself (for example `node-role.kubernetes.io/worker`) goes on through the API once the node registers.
 
 #### Applied taints
-Floci configures `--kubelet-arg=register-with-taints=...` using the taints specified on the nodegroup. Each taint is formatted as `key=value:effect` (or `key:effect` if value is omitted or empty). AWS taint effects are mapped to standard Kubernetes casing:
-- `NO_SCHEDULE` maps to `NoSchedule`
-- `NO_EXECUTE` maps to `NoExecute`
-- `PREFER_NO_SCHEDULE` maps to `PreferNoSchedule`
+Each taint is registered as `key=value:effect` (or `key:effect` without a value), with the API effects mapped to Kubernetes casing: `NO_SCHEDULE` to `NoSchedule`, `NO_EXECUTE` to `NoExecute`, `PREFER_NO_SCHEDULE` to `PreferNoSchedule`. EKS registers a managed node group's taints when the node joins ([node taints](https://docs.aws.amazon.com/eks/latest/userguide/node-taints-managed-node-groups.html)).
 
-#### Single shared node mapping
-Floci runs one k3s container per cluster. The worker node reflects the metadata of the first active nodegroup (ordered by `createdAt` ascending, then `nodegroupName`). If additional nodegroups are created on the same cluster, Floci logs a warning that only the first nodegroup provides node metadata to the shared node.
-
-#### Timing and post-start nodegroups
-The kubelet applies `node-labels` and `register-with-taints` only when it registers the node, and a node group created on an ACTIVE cluster is stored after the node registered. Floci therefore also puts the first node group's labels and taints on the running node through its API server: when a node group is created or deleted on an ACTIVE cluster, when its labels or taints are updated, and whenever a started, restored or replaced container's node registers (retried for two minutes while the node is not there yet). Floci records the keys it manages in the node annotations `floci.io/eks-nodegroup-labels` and `floci.io/eks-nodegroup-taints`, so a later sync removes only the labels and taints it put there and keeps those a workload or an operator added; deleting the last node group removes them. The zone, region and instance-type labels are overwritten but never removed, and `beta.kubernetes.io/instance-type` is set to the same value as `node.kubernetes.io/instance-type`, because the cloud node controller embedded in k3s treats the beta label as the source of truth and resets the GA label to it ([cloud-provider `node_controller.go`](https://github.com/kubernetes/cloud-provider/blob/v0.33.1/controllers/node/node_controller.go)). A taint is identified by its key and effect, as Kubernetes identifies it. Surviving cluster containers are adopted as-is without rebuilding kubelet flags on restore; the API sync brings their node in line.
+#### Labels and taints after registration
+`UpdateNodegroupConfig` changes the labels and taints of every running node through the API server, and nodes launched afterwards register with the new ones. Floci records the keys it manages in the node annotations `floci.io/eks-nodegroup-labels` and `floci.io/eks-nodegroup-taints`, so it removes only the labels and taints it put there and keeps those a workload or an operator added. The zone, region and instance-type labels are overwritten but never removed. A taint is identified by its key and effect, as Kubernetes identifies it.
 
 ### Metadata only inputs
 
@@ -556,93 +548,41 @@ A restored cluster reports `CREATING` until its API server answers again, then r
 back (for example Docker is unavailable), the cluster is marked `FAILED` instead of appearing
 `ACTIVE` while unreachable.
 
+#### Managed nodes
+
+A cluster runs as an agentless k3s server, the managed control plane, plus one k3s agent container per managed node group node. The server runs no kubelet (`--disable-agent`), so `kubectl get nodes` lists only managed nodes, as on EKS, where control plane hosts never appear as nodes ([EKS architecture](https://docs.aws.amazon.com/eks/latest/userguide/eks-architecture.html)). A cluster with no node group therefore has no node: CoreDNS and every pod stay `Pending` until a node group gives the cluster one (Fargate profiles do not, see below). The server reaches kubelets and pods through the agents' tunnels (`--egress-selector-mode=cluster`), so `kubectl logs`, `exec`, `port-forward` and `kubectl top` work. It enables the `NodeRestriction` and `ExtendedResourceToleration` admission plugins, both in EKS's enabled list ([platform versions](https://docs.aws.amazon.com/eks/latest/userguide/platform-versions.html)).
+
+**Networks.** The server and its agents share a Docker network of the cluster's own (`floci-aws-eks-net.<cluster>`, on a free `10.250.X.0/24`), where the server holds `.10`, which it advertises and agents join it at, and each node a fixed address from `.20`. Flannel carries pod traffic over this network whatever other networks a node joins. When the node group's subnet is a Docker-backed EC2 subnet (VPC networks are on by default), the node also joins the VPC's Docker network at an address leased from that subnet, and that address is its `InternalIP`, the private IP of its EC2 instance and the source of its name, as on EKS (nodeadm passes the instance's private IPv4 as `--node-ip`, [`config.go`](https://github.com/awslabs/amazon-eks-ami/blob/cb447b971ee8dcf121c4f12887455ca21590ff5d/nodeadm/internal/kubelet/config.go#L406-L428)). A subnet EC2 does not know, or VPC networks turned off, gives the node its cluster network address instead. When Floci runs in a container, nodes also join its network, so they reach Floci's ECR mirror, IMDS relay and DNS.
+
+**Names and identity.** A node is named after its EC2 private DNS name, the IP name EC2 gives by default: `ip-10-0-1-23.ec2.internal` in `us-east-1`, `ip-10-0-1-23.<region>.compute.internal` elsewhere; a launch template whose `PrivateDnsNameOptions.HostnameType` is `resource-name` names it after its instance ID instead ([EC2 hostname types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/hostname-types.html), [nodeadm `config.go`](https://github.com/awslabs/amazon-eks-ami/blob/cb447b971ee8dcf121c4f12887455ca21590ff5d/nodeadm/internal/kubelet/config.go#L275-L290)). Its instance ID (`i-` and 17 hex digits) is derived from the node group and a launch counter, so a replacement node gets a new ID, address and name, as an EC2 replacement does. Its `spec.providerID` is `aws:///<availability-zone>/<instance-id>` ([`getProviderId`](https://github.com/awslabs/amazon-eks-ami/blob/cb447b971ee8dcf121c4f12887455ca21590ff5d/nodeadm/internal/kubelet/config.go#L401-L403)), the zone being that of its subnet. New nodes go to the node group's subnet holding the fewest of its nodes, in request order; a scale-in terminates the newest node of the zone holding the most (how EKS's Auto Scaling group balances and picks is not verified here). EC2 `DescribeInstances` lists each node as a running instance with the node's ID, private IP, DNS name, subnet, AMI and the tag `aws:eks:cluster-name` ([EKS tags](https://docs.aws.amazon.com/eks/latest/userguide/eks-using-tags.html)); its `eks:cluster-name`, `eks:nodegroup-name`, `aws:autoscaling:groupName` and `kubernetes.io/cluster/<name>` tags follow what managed node instances are seen to carry (not verified), and its instance profile is synthesized for the node group. Floci's DNS answers the node's name, and its DNS queries are attributed to its VPC for Route 53 Resolver rules.
+
+**Pod capacity.** A node holds `ENIs * (IPv4 addresses per ENI - 1) + 2` pods for its instance type ([`eni_max_pods.go`](https://github.com/awslabs/amazon-eks-ami/blob/cb447b971ee8dcf121c4f12887455ca21590ff5d/nodeadm/internal/kubelet/eni_max_pods.go#L63-L79)), capped at 110 under 30 vCPUs and 250 above, as EKS caps managed node groups without a custom AMI ([choosing an instance type](https://docs.aws.amazon.com/eks/latest/userguide/choosing-instance-type.html)); with several instance types, the smallest applies to every node ([prefix delegation](https://docs.aws.amazon.com/eks/latest/userguide/cni-increase-ip-addresses.html)); an instance type the catalog lacks gets 110. It is passed as the kubelet's `max-pods`, so `status.capacity.pods` reads, for example, 17 on a `t3.medium` and 29 on an `m5.large`. The catalog carries the ENI figures of the EKS AMI's [`instance-info.jsonl`](https://github.com/awslabs/amazon-eks-ami/blob/cb447b971ee8dcf121c4f12887455ca21590ff5d/nodeadm/internal/kubelet/instance-info.jsonl) for the common EKS and GPU types it adds (`t3.large`, `m5.xlarge`, `c5.large`, `m6i.large`, `g4dn.xlarge`, `g5.xlarge`, `g5.12xlarge`, `g6.xlarge` and others).
+
+**GPUs.** A node of a GPU instance type advertises its GPUs as `nvidia.com/gpu` capacity and allocatable, from the EC2 catalog's GPU count ([accelerated computing instances](https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html)), which `DescribeInstanceTypes` now reports as `GpuInfo` too. This is a deviation: EKS's AL2023 NVIDIA AMIs do not include the NVIDIA device plugin, so on EKS the resource appears only once the user installs it ([accelerated AMIs](https://docs.aws.amazon.com/eks/latest/userguide/ml-eks-optimized-ami.html)); a device plugin cannot run without a GPU, so Floci sets the capacity on the node status itself, on every GPU instance type. EKS adds no taint to GPU nodes; a node group's own `nvidia.com/gpu` taint is tolerated automatically by pods that request a GPU, through `ExtendedResourceToleration`. No GPU is attached: workloads that need CUDA do not run.
+
+**Node cap.** Floci runs at most `floci.services.eks.max-nodes-per-cluster` agents per cluster (default 5, `0` for no cap), giving them to node groups in creation order (EKS has no system node group). Nodes past the cap keep their record, and the API reports every node group's requested size, but they have no agent, no Node object and no EC2 instance; Floci logs one warning per change naming the node groups short of nodes. Raising the cap, or removing other nodes, starts them.
+
+**Lifecycle and statuses.** A node reconciler brings each cluster's agents in line with its node groups, one pass at a time per cluster, when a node group is created, updated or deleted, when the cluster becomes `ACTIVE`, and every 30 seconds, which recreates an agent that died (on its volume, under the same name) and removes agents no node has. A node group is `CREATING` until each of its nodes under the cap is Ready, runs its version and has no `node.cloudprovider.kubernetes.io/uninitialized` taint, then `ACTIVE`. Past `floci.services.eks.node-ready-timeout-seconds` (default 900, EKS's 15 minutes, [troubleshooting](https://docs.aws.amazon.com/eks/latest/userguide/troubleshooting.html)) it is `CREATE_FAILED` with a `NodeCreationFailure` issue, or `AsgInstanceLaunchFailures` when Docker could not create a node's container ([`Issue`](https://docs.aws.amazon.com/eks/latest/APIReference/API_Issue.html)). An `ACTIVE` node group whose node cannot be launched again is `DEGRADED` with that issue until it can (when EKS sets `DEGRADED` is not documented; this is Floci's mapping). `DeleteNodegroup` returns the node group `DELETING`, and its record goes once its agents, Node objects and VPC leases are gone; `DeleteCluster` keeps refusing while a node group is listed, `DELETING` ones included. CloudFormation waits for a node group to be `ACTIVE` after create and gone after delete. Mock mode and clusters without Docker keep creating and deleting node groups at once.
+
+**Restore.** In a persistent storage mode, a restarted Floci re-claims the VPC addresses of stored nodes, adopts the server, then adopts each node's agent by name and specification label (starting it if stopped), recreates a missing one on its volume with the same identity (its node password, derived from the join token and its name, lets it rejoin under that name), and removes agents no node has. Memory mode restores nothing.
+
+**Clusters created before managed nodes.** A cluster stored by an earlier Floci has no topology recorded. It is adopted as the single-node cluster it was, and keeps working as before: one k3s container that is also the node, named `i-<hash>.<domain>`, carrying the first node group's labels and taints, sized from its instance type, and running launch template user data once ([Single shared node](#single-shared-node-of-earlier-clusters)). Nothing migrates it; recreate the cluster to get managed nodes.
+
+**Fargate.** Fargate profiles stay metadata: pods a Fargate profile would run get no per-pod node and stay `Pending` unless a node group's node takes them.
+
+**Not emulated.** Node repair, warm pools and Spot interruptions; scale-in does not drain, as EKS scaling ignores PodDisruptionBudgets ([update managed node group](https://docs.aws.amazon.com/eks/latest/userguide/update-managed-node-group.html)). The IMDS and pod identity relays run in each node as they ran in the single node, and need `socat` and `curl`, which the stock k3s image lacks, so on stock images they log a warning and do not run. `local-path` volumes (`default-storage-class: true`) live on one node and are lost to their pods when that node is replaced.
+
 #### Cluster node capacity
 
-Floci runs one k3s container per cluster. Before a node group exists, its node uses the
-`m5.large` entry in the EC2 instance type catalog. Creating the first node group selects the
-group's first `instanceTypes` entry. If that changes the type, Floci recreates the container,
-keeps its named k3s data volume, and reuses its published API port so existing kubeconfigs stay
-valid. Later node groups share this node and cannot change its type. An unknown type falls back to
-`m5.large` with a warning. The synthesized EC2 instance reports the selected type.
-First-group selection is serialized per cluster. If the replacement fails, Floci recreates the
-previous node, marks that node group `CREATE_FAILED`, and keeps its data volume. If recovery also
-fails, the cluster becomes `FAILED` instead of waiting indefinitely for readiness.
-Groups remain `CREATING` while launch-template user data runs. Later groups wait for the first
-group's result before accepting its node type as the shared capacity.
+Each node's container receives a hard CPU quota equal to its instance type's vCPUs and a memory limit equal to its catalog memory plus 10% headroom (at least 128 MiB), both capped by Docker's host capacity, memory at 80% of the Docker host's memory. The server has no limit. `floci.services.eks.max-memory-mib` and `floci.services.eks.max-vcpus` provide optional lower ceilings per node; zero means no extra ceiling (`FLOCI_SERVICES_EKS_MAX_MEMORY_MIB`, `FLOCI_SERVICES_EKS_MAX_VCPUS`). An instance type absent from the catalog is sized as `m5.large`, with a warning, while the node keeps its requested type's `node.kubernetes.io/instance-type` label.
 
-The container receives a hard CPU quota equal to the selected type's vCPUs and a memory limit
-equal to its catalog memory plus 10% headroom (at least 128 MiB). Both are capped by Docker's host
-capacity. Memory is capped at 80% of the Docker host's memory so other processes can continue to
-run. `floci.services.eks.max-memory-mib` and `floci.services.eks.max-vcpus` provide optional lower
-ceilings; zero means no extra ceiling. Their environment variables are `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB`
-and `FLOCI_SERVICES_EKS_MAX_VCPUS`.
+Those ceilings can only lower a node. To give workloads more room locally than the node group asks for on AWS, set `floci.services.eks.node-instance-type` (`FLOCI_SERVICES_EKS_NODE_INSTANCE_TYPE`) to a catalog type such as `t2.2xlarge`: node containers and their kubelet reservations are then sized from it, while `DescribeNodegroup`, the nodes' instance-type label and their EC2 instances keep the requested type, so the same Terraform plans no changes. A type absent from the catalog is ignored with a warning. This setting is Floci-only.
 
-Those ceilings can only lower the node. To give a workload more room locally than its node group
-asks for on AWS, set `floci.services.eks.node-instance-type` (`FLOCI_SERVICES_EKS_NODE_INSTANCE_TYPE`)
-to a catalog type such as `t2.2xlarge`. The node container's memory and CPU and its kubelet
-reservations are then sized from that type (k3s `maxPods` does not change), while
-`DescribeNodegroup`, the node's `node.kubernetes.io/instance-type` label and the synthesized EC2
-instance keep the requested type, so the same Terraform plans no changes. The two ceilings still apply on top. A type absent from the catalog is ignored with a
-warning. Changing the setting recreates a surviving node on the next start, keeping its data volume.
-This setting is Floci-only; it has no AWS equivalent.
+The same calculation sets each kubelet's `kube-reserved`, `system-reserved` and `eviction-hard` flags. The EKS AMI reserves `255 + 11 * maxPods` MiB and a tiered CPU fraction for kubelet and the container runtime, `maxPods` being the node's pod capacity above. Floci's `system-reserved` memory holds the container headroom, and its CPU reservation excludes the Docker host CPUs outside the container quota. Its absolute `memory.available` threshold includes the difference between Docker host memory and the container limit, plus a 100 MiB eviction buffer, because kubelet in the nested container can report host memory while the kernel enforces the smaller cgroup limit. The node filesystem eviction defaults remain at 10% available space and 5% free inodes. The formulas follow the [EKS AMI nodeadm source](https://github.com/awslabs/amazon-eks-ami/blob/cb447b971ee8dcf121c4f12887455ca21590ff5d/nodeadm/internal/kubelet/config.go#L293-L307) and [AWS's node memory calculation](https://docs.aws.amazon.com/batch/latest/userguide/memory-cpu-batch-eks.html). If Docker cannot report host capacity, or the host is too small to leave 256 MiB for pods after reservations, Floci warns and launches the node without the derived limits or kubelet arguments; an explicit ceiling remains a hard bound. A change of these inputs recreates the node's agent on its volume.
 
-The same calculation sets kubelet's `kube-reserved`, `system-reserved`, and `eviction-hard` flags.
-The EKS AMI reserves `255 + 11 * maxPods` MiB and a tiered CPU fraction for kubelet and the
-container runtime. Floci derives `maxPods` from the catalog's primary network card and IPv4
-addresses per interface. Its `system-reserved` memory holds the container headroom, and its CPU
-reservation excludes the Docker host CPUs outside the container quota. Its absolute
-`memory.available` threshold includes the difference between Docker host memory and the container
-limit, plus a 100 MiB eviction buffer. This is necessary because kubelet in the nested container
-can report host memory while the kernel enforces the smaller cgroup limit.
-The EKS node filesystem eviction defaults remain at 10% available space and 5% free inodes.
-The pod-density calculation uses EKS managed node group caps of 110 pods up to 30 vCPUs and
-250 pods above 30 vCPUs; it does not change k3s `maxPods`.
+#### Single shared node of earlier clusters
 
-If Docker cannot report host capacity, or the host is too small to leave 256 MiB for pods after
-reservations, Floci warns and launches the cluster without the derived limits or kubelet arguments.
-This preserves startup on small hosts. An explicit memory or CPU ceiling remains a hard bound even
-when Docker host information is unavailable; in that case Floci cannot calculate kubelet arguments.
-When an explicit memory ceiling is smaller than the default reservation budget, Floci reduces the
-memory reservations to leave some room for pods and warns that they no longer match the EKS AMI
-amount.
-
-The reservation formulas follow the [EKS AMI nodeadm source](https://github.com/awslabs/amazon-eks-ami/blob/main/nodeadm/internal/kubelet/config.go) and [AWS's node memory calculation](https://docs.aws.amazon.com/batch/latest/userguide/memory-cpu-batch-eks.html).
-On restore, a surviving container whose capacity label differs from the current calculation is
-recreated against the retained data volume, reusing its published API port. Floci keeps the old
-container until the replacement starts and restarts it if replacement fails. This also upgrades
-containers started before resource limits were available. If Docker cannot remove the stopped
-backup after a successful replacement, the new node keeps running and cluster deletion retries
-the backup cleanup after stopping the live node. If cleanup still fails, deletion reports the
-error and can be retried before the data volume is removed. Backup container names put the
-`capacity-backup.` marker before the account-qualified cluster name, for example
-`floci-aws-eks-capacity-backup.demo` for the default account and
-`floci-aws-eks-capacity-backup.999999999999.demo` for another account. The configured Docker resource
-namespace applies to backups too. This keeps backup names outside both accounts' live-container
-namespaces without changing existing cluster container names or data volumes.
-Cleanup only targets this backup namespace; it does not look up old suffix-form names, which can
-identify another account's live cluster. Verify ownership before manually removing leftover stopped
-backups after upgrading.
-
-#### Cluster node naming, provider ID, and topology labels
-
-In real mode, cluster nodes are named after their backing EC2 instance's private DNS name using AWS resource-based naming. Real EKS nodes take their Kubernetes name from the instance's private DNS name (`system:node:{{EC2PrivateDNSName}}`). Under resource-based naming, this hostname includes the domain: `i-<instance-id>.ec2.internal` in `us-east-1`, or `i-<instance-id>.<region>.compute.internal` in other regions. Floci implements resource-based naming by deriving the instance ID and domain deterministically from the cluster identity, passing `--node-name=<privateDnsName>` to k3s before startup, and assigning the same `PrivateDnsName` to the synthetic EC2 node instance. This keeps the node name stable across container restarts and recreations, and ensures agreement between Kubernetes node queries and EC2 `DescribeInstances`.
-
-Cluster nodes also carry a Kubernetes `spec.providerID` matching the AWS format:
-
-```text
-aws:///<availability-zone>/<instance-id>
-```
-
-For example, `aws:///us-east-1a/i-0123456789abcdef0`. Floci derives this identifier deterministically before container startup and passes `--kubelet-arg=provider-id=<providerId>` to k3s.
-
-Cluster nodes also carry standard Kubernetes topology labels:
-
-- `topology.kubernetes.io/zone`
-- `topology.kubernetes.io/region`
-
-Floci derives the availability zone from the cluster region (for example, `<region>a` for `us-east-1`, yielding `us-east-1a`), rather than from node group subnets as real EKS does. The zone matches the availability zone in the node's `spec.providerID` and synthetic EC2 node instance. These labels enable topology-aware scheduling and allow controllers such as the AWS EBS CSI driver to discover the node's availability zone.
-
-The node name, the instance ID in `spec.providerID`, and the synthetic EC2 instance (`InstanceId` and `PrivateDnsName`) all describe the same instance. This enables controllers that reconcile nodes against EC2 (such as CSI drivers) to look up the node instance via `DescribeInstances`.
+A cluster stored before managed nodes (no topology recorded) keeps one k3s container that is both control plane and node, as Floci ran every cluster before. Its node is named after a synthesized EC2 instance with resource-based naming (`i-<hash>.ec2.internal`), with the provider ID `aws:///<region>a/<instance-id>`, and carries the labels and taints of its first active node group (by `createdAt`, then name); later node groups share it and log a warning. The first node group selects the node's instance type and recreates the container if it changes, keeping its volume and port; launch template user data runs once in it; `desiredSize` adds no node; `UpdateClusterVersion` moves its kubelet with the control plane. A surviving container whose capacity label differs from the current calculation is recreated against the retained data volume on restore, keeping the old one stopped (`floci-aws-eks-capacity-backup.<cluster>`) until the replacement starts.
 
 #### Storage classes
 
@@ -695,9 +635,12 @@ does not enable it; omitted or false values keep the simulated behavior.
 |---|---|---|
 | `FLOCI_SERVICES_EKS_ENABLED` | `true` | Enable the EKS service |
 | `FLOCI_SERVICES_EKS_MOCK` | `false` | Metadata-only mode (no Docker) |
-| `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB` | `0` | Optional k3s container memory ceiling in MiB |
-| `FLOCI_SERVICES_EKS_MAX_VCPUS` | `0` | Optional k3s container vCPU ceiling |
-| `FLOCI_SERVICES_EKS_NODE_INSTANCE_TYPE` | *(unset)* | Catalog instance type the k3s node container is sized from; the API keeps the node group's type |
+| `FLOCI_SERVICES_EKS_MAX_MEMORY_MIB` | `0` | Optional memory ceiling in MiB for each node's k3s container |
+| `FLOCI_SERVICES_EKS_MAX_VCPUS` | `0` | Optional vCPU ceiling for each node's k3s container |
+| `FLOCI_SERVICES_EKS_NODE_INSTANCE_TYPE` | *(unset)* | Catalog instance type node containers are sized from; the API keeps the node group's type |
+| `FLOCI_SERVICES_EKS_MAX_NODES_PER_CLUSTER` | `5` | Most nodes run as k3s agents per cluster, across its node groups in creation order; `0` for no cap ([Managed nodes](#managed-nodes)) |
+| `FLOCI_SERVICES_EKS_NODE_READY_TIMEOUT_SECONDS` | `900` | How long a node group waits for its nodes to be Ready before it is `CREATE_FAILED` (`NodeCreationFailure`) |
+| `FLOCI_SERVICES_EKS_NODE_DRAIN_TIMEOUT_SECONDS` | `900` | How long a version update waits for a node to drain before it fails (`PodEvictionFailure`), unless forced |
 | `FLOCI_SERVICES_EKS_DEFAULT_IMAGE` | `rancher/k3s:latest` | k3s Docker image fallback |
 | `FLOCI_SERVICES_EKS_IMAGE_TEMPLATE` | *(unset)* | Format string for custom k3s images (e.g. `myregistry.io/k3s:v%s`), taking cluster version |
 | `FLOCI_SERVICES_EKS_API_SERVER_BASE_PORT` | `6500` | First port in the k3s API server range |
@@ -713,9 +656,9 @@ does not enable it; omitted or false values keep the simulated behavior.
 | `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS` | `false` | Retain k3s bundled local-path provisioner and default StorageClass (default false matches EKS with no default class) |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
-| `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in cluster containers |
+| `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in node containers |
 | `FLOCI_SERVICES_EKS_EMBEDDED_DNS` | `true` | Inject Floci's embedded DNS server into cluster containers for Route 53 private hosted zones and internal name resolution |
-| `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into k3s cluster containers |
+| `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into node containers |
 
 ### Kubernetes versions and network configuration
 
@@ -748,7 +691,7 @@ Floci validates that `serviceIpv4Cidr` falls within RFC 1918 private address ran
 
 ### VPC route table programming
 
-When a cluster is created in a VPC (`resourcesVpcConfig.vpcId` is specified) and `floci.services.eks.vpc-route-programming` is enabled (`true` by default), Floci inspects the VPC route tables and programs matching routes into the k3s cluster container via `ip route replace <dest> via <gw>`.
+When a cluster is created in a VPC (`resourcesVpcConfig.vpcId` is specified) and `floci.services.eks.vpc-route-programming` is enabled (`true` by default), Floci inspects the VPC route tables and programs matching routes into each node's k3s container (the single container of a [cluster created before managed nodes](#single-shared-node-of-earlier-clusters)) via `ip route replace <dest> via <gw>`, and reprograms every node when a route table changes.
 
 - **Association rules**:
   - If the cluster specifies `subnetIds`, Floci resolves the route table explicitly associated with each subnet. Subnets without an explicit association fall back to the VPC main route table. Route tables associated only with other subnets in the VPC are ignored.
@@ -829,10 +772,10 @@ group's launch template user data, which writes containerd
 under `/etc/containerd/certs.d/<host>/hosts.toml`.
 
 Floci links `/etc/containerd/certs.d` to k3s's containerd certs directory
-(`/var/lib/rancher/k3s/agent/etc/containerd/certs.d`) inside the cluster container before it
-starts. Standard launch template user data works unchanged: pull-through cache endpoints, custom
-request headers, and TLS settings take effect immediately, and the files persist across cluster
-container restarts in the cluster's named data volume.
+(`/var/lib/rancher/k3s/agent/etc/containerd/certs.d`) inside each node's container before it
+starts. Standard launch template user data, which runs on each node, works unchanged: pull-through
+cache endpoints, custom request headers, and TLS settings take effect immediately, and the files
+persist across restarts of the node in its named data volume.
 
 Example node group launch template user data configuring a pull-through cache with an auth header
 wrapped in MIME multipart for managed node groups:
@@ -872,11 +815,11 @@ services:
 ```
 
 ## Instance Metadata Service (IMDS)
-The cluster container is registered as a synthesized EC2 instance node (image `ami-eks-k3s`) regardless of whether IMDS is enabled, making it visible to the EC2 service (`DescribeInstances`, `DescribeInstanceStatus`, volume attachments, tagging). Its instance type is the node group's type, which also sizes the container unless `floci.services.eks.node-instance-type` is set.
+Each node is registered as a synthesized EC2 instance regardless of whether IMDS is enabled, making it visible to the EC2 service (`DescribeInstances`, `DescribeInstanceStatus`, volume attachments, tagging), with the node's ID, private IP, AMI and instance type ([Managed nodes](#managed-nodes)). A [cluster created before managed nodes](#single-shared-node-of-earlier-clusters) registers its single container instead (image `ami-eks-k3s`).
 
-When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each k3s cluster container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Inside the container, Floci adds `169.254.169.254/32` to the loopback interface (`lo`) and runs a lightweight `socat` TCP relay forwarding metadata requests to Floci's IMDS server.
+When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each node's k3s container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Inside the container, Floci adds `169.254.169.254/32` to the loopback interface (`lo`) and runs a lightweight `socat` TCP relay forwarding metadata requests to Floci's IMDS server.
 
-Both IMDSv1 and IMDSv2 (`PUT /latest/api/token`) are supported. The cluster container is registered as a synthesized EC2 instance node associated with the cluster's IAM role:
+Both IMDSv1 and IMDSv2 (`PUT /latest/api/token`) are supported. The relay needs `socat` and `curl`, which the stock k3s image lacks, so on stock images it logs a warning and does not run. Each node answers as its synthesized EC2 instance:
 
 ```bash
 # IMDSv2: obtain token
