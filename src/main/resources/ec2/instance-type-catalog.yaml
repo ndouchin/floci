@@ -1206,3 +1206,290 @@ instanceTypes:
     networkCards:
       - networkCardIndex: 0
         maximumNetworkInterfaces: 4
+
+  - instanceType: t3.large
+    processorManufacturer: Intel
+    vcpu: 2
+    memoryMib: 8192
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 12
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
+  - instanceType: t3.xlarge
+    processorManufacturer: Intel
+    vcpu: 4
+    memoryMib: 16384
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: t3.2xlarge
+    processorManufacturer: Intel
+    vcpu: 8
+    memoryMib: 32768
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: m5.xlarge
+    processorManufacturer: Intel
+    vcpu: 4
+    memoryMib: 16384
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: m5.2xlarge
+    processorManufacturer: Intel
+    vcpu: 8
+    memoryMib: 32768
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: m5.4xlarge
+    processorManufacturer: Intel
+    vcpu: 16
+    memoryMib: 65536
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 30
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 8
+
+  - instanceType: c5.large
+    processorManufacturer: Intel
+    vcpu: 2
+    memoryMib: 4096
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 10
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
+  - instanceType: c5.xlarge
+    processorManufacturer: Intel
+    vcpu: 4
+    memoryMib: 8192
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: m6i.large
+    processorManufacturer: Intel
+    vcpu: 2
+    memoryMib: 8192
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 10
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+
+  - instanceType: m6i.xlarge
+    processorManufacturer: Intel
+    vcpu: 4
+    memoryMib: 16384
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: r5.xlarge
+    processorManufacturer: Intel
+    vcpu: 4
+    memoryMib: 32768
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: false
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+
+  - instanceType: g4dn.xlarge
+    processorManufacturer: Intel
+    vcpu: 4
+    memoryMib: 16384
+    localStorageGiB: 125
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 10
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+    gpus: 1
+    gpuName: T4
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 16384
+
+  - instanceType: g4dn.2xlarge
+    processorManufacturer: Intel
+    vcpu: 8
+    memoryMib: 32768
+    localStorageGiB: 225
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 10
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 3
+    gpus: 1
+    gpuName: T4
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 16384
+
+  - instanceType: g5.xlarge
+    processorManufacturer: AMD
+    vcpu: 4
+    memoryMib: 16384
+    localStorageGiB: 250
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+    gpus: 1
+    gpuName: A10G
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 24576
+
+  - instanceType: g5.2xlarge
+    processorManufacturer: AMD
+    vcpu: 8
+    memoryMib: 32768
+    localStorageGiB: 450
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+    gpus: 1
+    gpuName: A10G
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 24576
+
+  - instanceType: g5.12xlarge
+    processorManufacturer: AMD
+    vcpu: 48
+    memoryMib: 196608
+    localStorageGiB: 3800
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 50
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 15
+    gpus: 4
+    gpuName: A10G
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 24576
+
+  - instanceType: g6.xlarge
+    processorManufacturer: AMD
+    vcpu: 4
+    memoryMib: 16384
+    localStorageGiB: 250
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+    gpus: 1
+    gpuName: L4
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 24576
+
+  - instanceType: g6.2xlarge
+    processorManufacturer: AMD
+    vcpu: 8
+    memoryMib: 32768
+    localStorageGiB: 450
+    supportedArchitectures:
+      - x86_64
+    currentGeneration: true
+    encryptionInTransitSupported: true
+    defaultNetworkCardIndex: 0
+    ipv4AddressesPerInterface: 15
+    networkCards:
+      - networkCardIndex: 0
+        maximumNetworkInterfaces: 4
+    gpus: 1
+    gpuName: L4
+    gpuManufacturer: NVIDIA
+    gpuMemoryMib: 24576

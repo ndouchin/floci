@@ -234,6 +234,10 @@ public class Ec2InstanceTypeCatalog {
         public Integer defaultNetworkCardIndex;
         public Integer ipv4AddressesPerInterface;
         public List<CatalogNetworkCard> networkCards = List.of();
+        public int gpus;
+        public String gpuName;
+        public String gpuManufacturer;
+        public int gpuMemoryMib;
 
         public Map<String, Object> toResponseMap() {
             Map<String, Object> type = new LinkedHashMap<>();
@@ -255,6 +259,15 @@ public class Ec2InstanceTypeCatalog {
                     .map(CatalogNetworkCard::toResponseMap)
                     .toList());
             type.put("networkInfo", networkInfo);
+            if (gpus > 0) {
+                Map<String, Object> gpuInfo = new LinkedHashMap<>();
+                gpuInfo.put("name", gpuName);
+                gpuInfo.put("manufacturer", gpuManufacturer);
+                gpuInfo.put("count", gpus);
+                gpuInfo.put("memoryMib", gpuMemoryMib);
+                gpuInfo.put("totalGpuMemoryMib", gpus * gpuMemoryMib);
+                type.put("gpuInfo", gpuInfo);
+            }
             return type;
         }
     }

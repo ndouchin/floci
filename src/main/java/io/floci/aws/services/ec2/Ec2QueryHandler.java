@@ -5156,8 +5156,24 @@ public class Ec2QueryHandler {
                         .end("item");
             }
             xml.end("networkCards")
-                    .end("networkInfo")
-                    .end("item");
+                    .end("networkInfo");
+            Map<String, Object> gpuInfo = (Map<String, Object>) t.get("gpuInfo");
+            if (gpuInfo != null) {
+                xml.start("gpuInfo")
+                        .start("gpus")
+                        .start("item")
+                        .elem("name", (String) gpuInfo.get("name"))
+                        .elem("manufacturer", (String) gpuInfo.get("manufacturer"))
+                        .elem("count", (Integer) gpuInfo.get("count"))
+                        .start("memoryInfo")
+                        .elem("sizeInMiB", (Integer) gpuInfo.get("memoryMib"))
+                        .end("memoryInfo")
+                        .end("item")
+                        .end("gpus")
+                        .elem("totalGpuMemoryInMiB", (Integer) gpuInfo.get("totalGpuMemoryMib"))
+                        .end("gpuInfo");
+            }
+            xml.end("item");
         }
         xml.end("instanceTypeSet").end("DescribeInstanceTypesResponse");
         return xmlResponse(xml.build());
