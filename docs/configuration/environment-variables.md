@@ -520,6 +520,12 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EKS_API_SERVER_MAX_PORT` | `6599` | Last port in the Kubernetes API server range |
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Keep EKS containers running when Floci stops |
 | `FLOCI_SERVICES_EKS_DOCKER_NETWORK` | _(none)_ | Docker network for EKS containers |
+| `FLOCI_SERVICES_EKS_MAX_NODES_PER_CLUSTER` | `5` | Most managed nodes Floci runs as k3s agents per cluster, across its node groups in creation order; nodes past it keep their record but get no agent; `0` for no cap ([Managed nodes](../services/eks.md#managed-nodes)) |
+| `FLOCI_SERVICES_EKS_NODE_READY_TIMEOUT_SECONDS` | `900` | How long a node may take to register and turn Ready before its node group fails |
+| `FLOCI_SERVICES_EKS_NODE_DRAIN_TIMEOUT_SECONDS` | `900` | How long a version update waits for a node to drain before it fails, unless forced |
+| `FLOCI_SERVICES_EKS_LOAD_BALANCER_MODE` | `emulated` | How new clusters serve Services of type LoadBalancer: `emulated`, `servicelb` or `off` ([LoadBalancer Services](../services/eks.md#loadbalancer-services)) |
+| `FLOCI_SERVICES_EKS_LOAD_BALANCER_PROVISIONING_DELAY_SECONDS` | `0` | How long a new load balancer takes to get its hostname |
+| `FLOCI_SERVICES_EKS_LOAD_BALANCER_HOST_PORTS` | `dynamic` | The Docker host's `127.0.0.1` port for each load balancer port: `dynamic`, `same-as-service` or `none` |
 
 ### ECS (Elastic Container Service)
 
@@ -622,6 +628,7 @@ See [Web Console](../ui/index.md) for running the console and swapping in a thir
 | `FLOCI_SERVICES_NETWORKFIREWALL_ENABLED` | `true` | Enable the AWS Network Firewall service |
 | `FLOCI_SERVICES_SERVICEQUOTAS_ENABLED` | `true` | Enable the Service Quotas service |
 | `FLOCI_SERVICES_SERVICEQUOTAS_STANDARD_ON_DEMAND_VCPUS` | `5` | Non-negative applied Standard On-Demand vCPU quota reported per account and region; EC2 checks current running usage against it only when `FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS` is `true` |
+| `FLOCI_SERVICES_SERVICEQUOTAS_APPLIED_VALUES` | _(none)_ | Applied quota values that differ from AWS's defaults, as `<serviceCode>/<quotaCode>=<value>` entries separated by commas ([Service Quotas](../services/servicequotas.md#quotas-the-rosa-cli-checks)) |
 | `FLOCI_SERVICES_RAM_ENABLED` | `true` | Enable the AWS RAM service |
 | `FLOCI_SERVICES_BACKUP_ENABLED` | `true` | Enable the AWS Backup service |
 | `FLOCI_SERVICES_BACKUP_JOB_COMPLETION_DELAY_SECONDS` | `3` | Simulated delay before backup jobs transition to `COMPLETED` |

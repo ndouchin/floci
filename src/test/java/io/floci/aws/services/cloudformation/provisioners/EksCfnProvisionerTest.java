@@ -11,6 +11,7 @@ import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.CreateClusterRequest;
 import io.floci.aws.services.eks.model.Nodegroup;
+import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -29,6 +30,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -130,6 +132,72 @@ class EksCfnProvisionerTest {
         provisioner.delete(r, "us-east-1");
 
         verify(eks).deleteNodeGroup("prod", "workers");
+    }
+
+    @Test
+    void nodegroupDeleteWaitsUntilTheNodeGroupIsGone() {
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, 1, 5_000);
+        StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
+        r.setPhysicalId("prod/workers");
+        r.getAttributes().put("ClusterName", "prod");
+        r.getAttributes().put("NodegroupName", "workers");
+        when(eks.describeNodeGroup("prod", "workers")).thenReturn(nodegroup(NodegroupStatus.DELETING),
+                nodegroup(NodegroupStatus.DELETING)).thenThrow(new AwsException("ResourceNotFoundException", "gone", 404));
+
+        waiting.delete(r, "us-east-1");
+
+        verify(eks).deleteNodeGroup("prod", "workers");
+        verify(eks, times(3)).describeNodeGroup("prod", "workers");
+    }
+
+    @Test
+    void nodegroupDeleteThatNeverFinishesFailsTheResource() {
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, 1, 20);
+        StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
+        r.setPhysicalId("prod/workers");
+        r.getAttributes().put("ClusterName", "prod");
+        r.getAttributes().put("NodegroupName", "workers");
+        when(eks.describeNodeGroup("prod", "workers")).thenReturn(nodegroup(NodegroupStatus.DELETING));
+
+        assertThrows(IllegalStateException.class, () -> waiting.delete(r, "us-east-1"));
+    }
+
+    @Test
+    void nodegroupCreateWaitsUntilTheNodeGroupIsActive() throws Exception {
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, 1, 5_000);
+        when(eks.createNodeGroup(eq("prod"), any(Nodegroup.class))).thenReturn(nodegroup(NodegroupStatus.CREATING));
+        when(eks.describeNodeGroup("prod", "workers")).thenReturn(nodegroup(NodegroupStatus.CREATING),
+                nodegroup(NodegroupStatus.ACTIVE));
+
+        StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
+        waiting.provision(r, props(NODEGROUP_PROPS), ctx());
+
+        verify(eks, times(2)).describeNodeGroup("prod", "workers");
+        assertEquals("prod/workers", r.getPhysicalId());
+    }
+
+    @Test
+    void nodegroupThatFailsToCreateFailsTheResource() throws Exception {
+        EksCfnProvisioner waiting = new EksCfnProvisioner(eks, 1, 5_000);
+        when(eks.createNodeGroup(eq("prod"), any(Nodegroup.class))).thenReturn(nodegroup(NodegroupStatus.CREATING));
+        when(eks.describeNodeGroup("prod", "workers")).thenReturn(nodegroup(NodegroupStatus.CREATE_FAILED));
+
+        StackResource r = resource("AWS::EKS::Nodegroup", "Workers");
+        JsonNode properties = props(NODEGROUP_PROPS);
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> waiting.provision(r, properties, ctx()));
+        assertTrue(failure.getMessage().contains("CREATE_FAILED"), failure.getMessage());
+    }
+
+    private static final String NODEGROUP_PROPS = "{\"ClusterName\": \"prod\", \"NodegroupName\": \"workers\","
+            + " \"NodeRole\": \"arn:aws:iam::000000000000:role/nodes\", \"Subnets\": [\"subnet-1\"]}";
+
+    private static Nodegroup nodegroup(NodegroupStatus status) {
+        Nodegroup group = new Nodegroup();
+        group.setNodegroupName("workers");
+        group.setClusterName("prod");
+        group.setStatus(status);
+        return group;
     }
 
     @Test

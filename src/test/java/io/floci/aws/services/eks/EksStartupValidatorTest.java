@@ -10,6 +10,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -38,6 +39,42 @@ class EksStartupValidatorTest {
         assertDoesNotThrow(() -> mock.onStart(new StartupEvent()));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"emulated", "servicelb", "off"})
+    void everyLoadBalancerModeIsAccepted(String mode) {
+        assertDoesNotThrow(() -> validator(Optional.empty(), mode, "dynamic").onStart(new StartupEvent()));
+    }
+
+    @Test
+    void anUnknownLoadBalancerModeStopsTheBoot() {
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> validator(Optional.empty(), "klipper", "dynamic").onStart(new StartupEvent()));
+        assertTrue(refused.getMessage().contains("floci.services.eks.load-balancer.mode"), refused.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"dynamic", "same-as-service", "none"})
+    void everyHostPortsSettingIsAccepted(String hostPorts) {
+        assertDoesNotThrow(() -> validator(Optional.empty(), "emulated", hostPorts).onStart(new StartupEvent()));
+    }
+
+    @Test
+    void anUnknownHostPortsSettingStopsTheBoot() {
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> validator(Optional.empty(), "emulated", "random").onStart(new StartupEvent()));
+        assertTrue(refused.getMessage().contains("floci.services.eks.load-balancer.host-ports"), refused.getMessage());
+    }
+
+    private static EksStartupValidator validator(Optional<String> endpointHost, String mode, String hostPorts) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().eks().endpointHost()).thenReturn(endpointHost);
+        when(config.services().eks().enabled()).thenReturn(true);
+        when(config.services().eks().mock()).thenReturn(false);
+        when(config.services().eks().loadBalancer().mode()).thenReturn(mode);
+        when(config.services().eks().loadBalancer().hostPorts()).thenReturn(hostPorts);
+        return new EksStartupValidator(config);
+    }
+
     private static EksStartupValidator validator(Optional<String> endpointHost) {
         return validator(endpointHost, true, false);
     }
@@ -47,6 +84,8 @@ class EksStartupValidatorTest {
         when(config.services().eks().endpointHost()).thenReturn(endpointHost);
         when(config.services().eks().enabled()).thenReturn(enabled);
         when(config.services().eks().mock()).thenReturn(mock);
+        when(config.services().eks().loadBalancer().mode()).thenReturn("emulated");
+        when(config.services().eks().loadBalancer().hostPorts()).thenReturn("dynamic");
         return new EksStartupValidator(config);
     }
 }

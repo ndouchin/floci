@@ -198,6 +198,9 @@ public class ContainerBuilder {
         private final List<Device> devices = new ArrayList<>();
         private Long shmSizeBytes;
         private final Map<String, String> tmpfs = new HashMap<>();
+        private final Map<String, String> sysctls = new HashMap<>();
+        private final List<String> dnsSearch = new ArrayList<>();
+        private final List<String> dnsOptions = new ArrayList<>();
         private Long memorySwapBytes;
         private Long memorySwappiness;
         private boolean javaTrustStore;
@@ -716,6 +719,30 @@ public class ContainerBuilder {
             return this;
         }
 
+        /** Sets a namespaced kernel parameter in the container, as {@code docker run --sysctl} does. */
+        public Builder withSysctl(String name, String value) {
+            if (name != null && !name.isBlank() && value != null) {
+                this.sysctls.put(name.strip(), value);
+            }
+            return this;
+        }
+
+        /** Adds a search domain to the container's resolver, as {@code docker run --dns-search} does. */
+        public Builder withDnsSearch(String domain) {
+            if (domain != null && !domain.isBlank()) {
+                this.dnsSearch.add(domain.strip());
+            }
+            return this;
+        }
+
+        /** Adds an option to the container's resolver, as {@code docker run --dns-option} does. */
+        public Builder withDnsOption(String option) {
+            if (option != null && !option.isBlank()) {
+                this.dnsOptions.add(option.strip());
+            }
+            return this;
+        }
+
         /**
          * Caps memory plus swap ({@code --memory-swap}); a value equal to the memory limit means
          * the container does not swap.
@@ -821,7 +848,8 @@ public class ContainerBuilder {
                     Map.copyOf(portBindingHostIps),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, Map.copyOf(sysctls),
+                            List.copyOf(dnsSearch), List.copyOf(dnsOptions)),
                     javaTrustStore
             );
         }

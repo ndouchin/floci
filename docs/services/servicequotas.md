@@ -23,6 +23,43 @@ It defaults to 5. The AWS
 default read actions always return 5. EC2 can use this applied value for opt-in
 Standard On-Demand launch/start admission for each account and region; see [EC2 admission](ec2.md#standard-on-demand-admission).
 
+### Quotas the ROSA CLI checks
+
+`rosa create account-roles` and `rosa verify quota` list the quotas of five service codes and
+compare twelve of them with the values a cluster install needs (rosa v1.2.68,
+[`pkg/aws/quota.go`](https://github.com/openshift/rosa/blob/v1.2.68/pkg/aws/quota.go) and IAM's
+managed policies per role in
+[`pkg/policy/policy_service.go`](https://github.com/openshift/rosa/blob/v1.2.68/pkg/policy/policy_service.go)).
+Floci carries each of them with its AWS code, name and default value:
+
+| Service code | Quota code | Name | AWS default | rosa wants |
+| --- | --- | --- | --- | --- |
+| `ec2` | `L-0263D0A3` | EC2-VPC Elastic IPs | 5 | 5 |
+| `ec2` | `L-1216C47A` | Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances | 5 (see above) | 100 |
+| `vpc` | `L-F678F1CE` | VPCs per Region | 5 | 5 |
+| `vpc` | `L-A4707A72` | Internet gateways per Region | 5 | 5 |
+| `vpc` | `L-DF5E4CA3` | Network interfaces per Region | 5000 | 5000 |
+| `ebs` | `L-D18FCD1D` | Storage for General Purpose SSD (gp2) volumes, in TiB | 50, 300 outside the sixteen original regions | 50 |
+| `ebs` | `L-309BACF6` | Snapshots per Region | 100000 | 300 |
+| `ebs` | `L-B3A130E6` | IOPS for Provisioned IOPS SSD (io1) volumes | 300000 | 300000 |
+| `ebs` | `L-FD252861` | Storage for Provisioned IOPS SSD (io1) volumes, in TiB | 50, 300 outside the sixteen original regions | 50 |
+| `elasticloadbalancing` | `L-53DA6B97` | Application Load Balancers per Region | 50 | 50 |
+| `elasticloadbalancing` | `L-E9E9831D` | Classic Load Balancers per Region | 20 | 20 |
+| `iam` | `L-0DA4ABF3` | Managed policies per role | 10 | one more than the role has |
+
+Defaults are from AWS's quota pages for [VPC](https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html),
+[EBS](https://docs.aws.amazon.com/general/latest/gr/ebs-service.html),
+[Application](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-limits.html) and
+[Classic](https://docs.aws.amazon.com/elasticloadbalancing/latest/classic/elb-limits.html) Load Balancers and
+[IAM](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html). With them, rosa's check fails
+where it fails on a new AWS account, on the vCPU quota (`Service ec2 quota code L-1216C47A ... expected quota of at
+least 100, but got 5`). Raise it with `FLOCI_SERVICES_SERVICEQUOTAS_STANDARD_ON_DEMAND_VCPUS=100`, or with
+`FLOCI_SERVICES_SERVICEQUOTAS_APPLIED_VALUES=ec2/L-1216C47A=100`.
+
+`FLOCI_SERVICES_SERVICEQUOTAS_APPLIED_VALUES` sets the applied value of any quota in the catalog, as a
+comma-separated list of `<serviceCode>/<quotaCode>=<value>` entries; an `ec2/L-1216C47A` entry wins over the vCPU setting, in EC2 admission too. The AWS
+default read actions keep returning AWS's defaults. A malformed entry, or a negative value, stops Floci at startup.
+
 All other applied quotas and AWS default quotas return the same catalog data.
 `RequestServiceQuotaIncrease` is accepted and validated, records the request, and lets you read
 it back with `GetRequestedServiceQuotaChange` or list it with
@@ -36,8 +73,8 @@ Limitations.
 | --- | --- |
 | `ListServiceQuotas` | Lists the quotas for a service code; generated quotas for unknown codes |
 | `GetServiceQuota` | Returns one quota by service and quota code, else `NoSuchResourceException` |
-| `GetAWSDefaultServiceQuota` | Returns the catalog default, independent of the configured applied EC2 value |
-| `ListAWSDefaultServiceQuotas` | Lists catalog defaults, independent of the configured applied EC2 value |
+| `GetAWSDefaultServiceQuota` | Returns the catalog default, independent of the configured applied values |
+| `ListAWSDefaultServiceQuotas` | Lists catalog defaults, independent of the configured applied values |
 | `RequestServiceQuotaIncrease` | Validates and stores an increase request as `PENDING`; a second open request for the same quota is refused with `ResourceAlreadyExistsException` |
 | `GetRequestedServiceQuotaChange` | Returns a stored request by id, else `NoSuchResourceException` |
 | `ListRequestedServiceQuotaChangeHistoryByQuota` | Lists the stored requests for a service/quota pair, newest first |
@@ -76,6 +113,7 @@ Limitations.
 | --- | --- | --- |
 | `FLOCI_SERVICES_SERVICEQUOTAS_ENABLED` | `true` | Enables the service |
 | `FLOCI_SERVICES_SERVICEQUOTAS_STANDARD_ON_DEMAND_VCPUS` | `5` | Applied EC2 Standard On-Demand vCPU quota reported per local account and region; used by opt-in EC2 admission |
+| `FLOCI_SERVICES_SERVICEQUOTAS_APPLIED_VALUES` | none | Applied values that differ from AWS's defaults, as `<serviceCode>/<quotaCode>=<value>` entries separated by commas, for example `ec2/L-1216C47A=100,vpc/L-F678F1CE=10` |
 
 ## Example
 

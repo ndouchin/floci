@@ -22,6 +22,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.ec2.Ec2InstanceLaunchListener;
+import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.Ipv4Cidrs;
 import io.floci.aws.services.ec2.SecurityGroupPolicy;
@@ -37,9 +38,11 @@ import io.floci.aws.services.eks.model.CertificateAuthority;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterStatus;
+import io.floci.aws.services.eks.model.CreateAccessEntryRequest;
 import io.floci.aws.services.eks.model.CreateClusterRequest;
 import io.floci.aws.services.eks.model.CreateFargateProfileRequest;
 import io.floci.aws.services.eks.model.CreateNodeGroupRequest;
+import io.floci.aws.services.eks.model.EksNode;
 import io.floci.aws.services.eks.model.EncryptionConfig;
 import io.floci.aws.services.eks.model.ErrorDetail;
 import io.floci.aws.services.eks.model.FargateProfile;
@@ -67,6 +70,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -89,7 +93,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -148,6 +154,18 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     // Storage hands every caller the same live Cluster, and Cluster keeps identity equality.
     private final Set<Cluster> clustersBeingDeleted = ConcurrentHashMap.newKeySet();
     private final Set<String> restoringClusters = ConcurrentHashMap.newKeySet();
+    private final Ec2InstanceTypeCatalog instanceTypeCatalog = new Ec2InstanceTypeCatalog();
+    private volatile EksNodeReconciler nodeReconciler;
+    private volatile EksLoadBalancerController loadBalancerController;
+    private int nodeSweeps;
+    private final Set<String> loadBalancerPasses = ConcurrentHashMap.newKeySet();
+    private final Set<String> loadBalancersClosed = ConcurrentHashMap.newKeySet();
+    private static final long LOAD_BALANCER_CLOSE_WAIT_MILLIS = 180_000;
+    private final ExecutorService loadBalancerRunner = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "floci-eks-load-balancers");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -224,6 +242,15 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
         abandonInterruptedUpdates();
         if (!config.services().eks().mock()) {
+            if (clusterManager != null) {
+                nodeReconciler = new EksNodeReconciler(clusterManager.nodeAgents(), new NodeStore(),
+                        new EksNodeReconciler.Settings(config.services().eks().maxNodesPerCluster(),
+                                config.services().eks().nodeReadyTimeoutSeconds(),
+                                config.services().eks().nodeDrainTimeoutSeconds()), Clock.systemUTC());
+                loadBalancerController = new EksLoadBalancerController(clusterManager.loadBalancerRuntime(),
+                        clusterManager.loadBalancerRuntime(), clusterManager.loadBalancerNames(), Clock.systemUTC(),
+                        () -> config.services().eks().loadBalancer().provisioningDelaySeconds());
+            }
             restorePersistedClusters();
         } else {
             restoreMockJoinedInstances();
@@ -273,9 +300,16 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 LOG.infov("Restoring k3s container for persisted EKS cluster {0}", cluster.getName());
                 cluster.setStatus(ClusterStatus.CREATING);
                 cluster.setPodCidr(EksClusterManager.DEFAULT_POD_CIDR);
-                if (cluster.getNodeInstanceType() == null) {
+                if (cluster.getNodeInstanceType() == null && !cluster.isAgentless()) {
                     firstNodeGroup(cluster.getName(), entry.accountId()).ifPresent(group ->
                             cluster.setNodeInstanceType(selectedNodeInstanceType(group)));
+                }
+                if (cluster.isAgentless()) {
+                    for (Nodegroup group : listNodeGroupsForCluster(cluster.getName(), entry.accountId())) {
+                        for (EksNode node : group.getNodes()) {
+                            clusterManager.nodeAgents().reclaimAddress(cluster, node);
+                        }
+                    }
                 }
                 clusterManager.restoreCluster(cluster);
                 restoreJoinedInstances(entry.accountId(), cluster);
@@ -318,6 +352,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 String prefix = cluster.getName() + "/";
                 for (Nodegroup nodegroup : nodeGroupStorage.scan(key -> key.startsWith(prefix))) {
                     if (nodegroup.getStatus() == NodegroupStatus.UPDATING) {
+                        nodegroup.setPendingUpdateId(null);
+                        nodegroup.setPendingVersion(null);
+                        nodegroup.setPendingReleaseVersion(null);
+                        nodegroup.setPendingLaunchTemplate(null);
+                        nodegroup.setPendingForce(false);
+                        nodegroup.setPendingSince(null);
                         nodegroup.setStatus(NodegroupStatus.ACTIVE);
                         nodeGroupStorage.put(nodeGroupKey(cluster.getName(), nodegroup.getNodegroupName()), nodegroup);
                     }
@@ -660,6 +700,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     @PreDestroy
     public void shutdown() {
         poller.shutdownNow();
+        if (nodeReconciler != null) {
+            nodeReconciler.shutdown();
+        }
+        closeAllLoadBalancers();
         updateRunner.shutdownNow();
         addonRunner.shutdownNow();
         if (!config.services().eks().mock()) {
@@ -784,6 +828,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setPlatformVersion("eks.1");
         cluster.setCertificateAuthority(new CertificateAuthority(""));
         cluster.setMetricsServer(false);
+        cluster.setTopology(Cluster.AGENTLESS_TOPOLOGY);
+        cluster.setLoadBalancerMode(configuredLoadBalancerMode());
 
         try {
             String issuer = oidcService.newIssuerUrl(region);
@@ -1023,6 +1069,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         try {
             ClusterStatus previousStatus = cluster.getStatus();
             cluster.setStatus(ClusterStatus.DELETING);
+            String loadBalancerKey = cluster.getAccountId() + "/" + name;
+            closeLoadBalancers(loadBalancerKey);
             if (!config.services().eks().mock()) {
                 try {
                     clusterManager.stopCluster(cluster);
@@ -1045,8 +1093,15 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 clearAppliedClusterUserData(cluster, name);
                 oidcService.deleteKey(name);
             }
+            if (nodeReconciler != null) {
+                nodeReconciler.forget(cluster.getAccountId(), name);
+            }
+            if (loadBalancerController != null) {
+                loadBalancerController.forget(cluster);
+            }
             return cluster;
         } finally {
+            loadBalancersClosed.remove(cluster.getAccountId() + "/" + name);
             clustersBeingDeleted.remove(cluster);
         }
     }
@@ -1094,6 +1149,11 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             throw new AwsException("ResourceInUseException",
                     "Nodegroup already exists: " + nodegroupName, 409);
         }
+        if (request.getVersion() != null && !request.getVersion().isBlank()
+                && !request.getVersion().trim().equals(cluster.getVersion())) {
+            throw new AwsException("InvalidParameterException", "Nodegroup version " + request.getVersion().trim()
+                    + " must match cluster version " + cluster.getVersion(), 400);
+        }
 
         String region = resolveClusterRegion(cluster);
         LaunchTemplateData launchTemplateData = validateLaunchTemplate(region, request.getLaunchTemplate());
@@ -1111,16 +1171,19 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         nodeGroup.setAccountId(accountId);
         nodeGroup.setCreatedAt(now);
         nodeGroup.setModifiedAt(now);
-        String resolvedVersion = request.getVersion() != null ? request.getVersion() : cluster.getVersion();
+        String resolvedVersion = request.getVersion() != null && !request.getVersion().isBlank()
+                ? request.getVersion().trim() : cluster.getVersion();
         nodeGroup.setVersion(resolvedVersion);
         nodeGroup.setReleaseVersion(request.getReleaseVersion() != null
-                ? request.getReleaseVersion() : resolvedVersion + "-eks-1");
+                ? request.getReleaseVersion() : EksNodeLayout.releaseVersion(resolvedVersion));
         nodeGroup.setStatus(NodegroupStatus.ACTIVE);
         nodeGroup.setCapacityType(request.getCapacityType() != null ? request.getCapacityType() : "ON_DEMAND");
         nodeGroup.setScalingConfig(request.getScalingConfig() != null ? request.getScalingConfig() : defaultScalingConfig());
         nodeGroup.setInstanceTypes(request.getInstanceTypes() != null ? request.getInstanceTypes() : List.of("t3.medium"));
         nodeGroup.setSubnets(request.getSubnets() != null ? request.getSubnets() : List.of());
-        nodeGroup.setAmiType(request.getAmiType() != null ? request.getAmiType() : "AL2_x86_64");
+        nodeGroup.setAmiType(request.getAmiType() != null ? request.getAmiType()
+                : launchTemplateData != null && launchTemplateData.getImageId() != null ? "CUSTOM"
+                : EksNodeLayout.defaultAmiType(resolvedVersion, nodeGroup.getInstanceTypes(), instanceTypeCatalog));
         nodeGroup.setNodeRole(request.getNodeRole());
         nodeGroup.setDiskSize(request.getDiskSize() != null ? request.getDiskSize() : 20);
         nodeGroup.setResources(defaultNodeGroupResources(nodegroupName));
@@ -1135,6 +1198,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         nodeGroup.setWarmPoolConfig(request.getWarmPoolConfig());
         nodeGroup.setLabels(request.getLabels() != null ? new HashMap<>(request.getLabels()) : null);
         nodeGroup.setTags(request.getTags() != null ? new HashMap<>(request.getTags()) : new HashMap<>());
+
+        if (cluster.isAgentless()) {
+            Nodegroup created = createAgentlessNodeGroup(clusterName, accountId, storageKey, nodeGroup);
+            grantNodeRoleAccess(cluster, created.getNodeRole());
+            return created;
+        }
 
         String capacityKey = accountId + "/" + clusterName;
         Object capacityLock = capacityLock(accountId, clusterName);
@@ -1234,7 +1303,63 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         if (nodeGroup.getStatus() == NodegroupStatus.ACTIVE) {
             syncNodeWhenRunning(clusterName);
         }
+        grantNodeRoleAccess(cluster, nodeGroup.getNodeRole());
         return nodeGroup;
+    }
+
+    /**
+     * EKS gives a managed node group's role an access entry when the cluster uses access entries; Floci makes it
+     * of type EC2_LINUX, the node type it supports (the type EKS uses for managed node roles is not documented). A
+     * role IAM does not know, or one that has an entry already, keeps what it has.
+     */
+    private void grantNodeRoleAccess(Cluster cluster, String nodeRole) {
+        if (accessEntries == null || nodeRole == null || cluster.getAccessConfig() == null
+                || "CONFIG_MAP".equals(cluster.getAccessConfig().authenticationMode())) {
+            return;
+        }
+        try {
+            accessEntries.create(cluster, new CreateAccessEntryRequest(nodeRole, "EC2_LINUX", null, null, null, null));
+            LOG.infov("Created the EC2_LINUX access entry of node role {0} in EKS cluster {1}", nodeRole,
+                    cluster.getName());
+        } catch (AwsException e) {
+            LOG.debugv("Node role {0} of EKS cluster {1} gets no access entry: {2}", nodeRole, cluster.getName(),
+                    e.getMessage());
+        }
+    }
+
+    /**
+     * CreateNodegroup on a multi-node cluster: the node group is CREATING until the node reconciler has its nodes
+     * Ready as k3s agents, as EKS reports a node group until its instances join; a cluster with no Kubernetes
+     * runtime (mock mode, no Docker) has nothing to launch, so its node group is ACTIVE at once.
+     */
+    private Nodegroup createAgentlessNodeGroup(String clusterName, String accountId, String storageKey,
+                                               Nodegroup nodeGroup) {
+        boolean launches;
+        synchronized (capacityLock(accountId, clusterName)) {
+            if (nodeGroupStorage.get(storageKey).isPresent()) {
+                throw new AwsException("ResourceInUseException", "Nodegroup already exists: "
+                        + nodeGroup.getNodegroupName(), 409);
+            }
+            Cluster current = describeCluster(clusterName);
+            launches = runsNodes(current);
+            nodeGroup.setStatus(launches ? NodegroupStatus.CREATING : NodegroupStatus.ACTIVE);
+            nodeGroupStorage.put(storageKey, nodeGroup);
+        }
+        if (launches) {
+            requestNodes(accountId, clusterName);
+        }
+        return nodeGroup;
+    }
+
+    /** Whether the cluster runs managed nodes as k3s agents, so node group changes take effect asynchronously. */
+    private boolean runsNodes(Cluster cluster) {
+        return cluster.isAgentless() && runsContainer(cluster) && nodeReconciler != null;
+    }
+
+    private void requestNodes(String accountId, String clusterName) {
+        if (nodeReconciler != null) {
+            nodeReconciler.request(accountId, clusterName);
+        }
     }
 
     /**
@@ -1246,6 +1371,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             return;
         }
         storage.get(clusterName)
+                .filter(cluster -> !cluster.isAgentless())
                 .filter(cluster -> cluster.getContainerId() != null && !cluster.isFinalizePending()
                         && cluster.getStatus() == ClusterStatus.ACTIVE)
                 .ifPresent(clusterManager::syncNodegroupToNode);
@@ -1343,19 +1469,39 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         return nodeGroupCapacityLocks.computeIfAbsent(accountId + "/" + clusterName, ignored -> new Object());
     }
 
+    /**
+     * DeleteNodegroup. On a multi-node cluster the node group is DELETING until the node reconciler has removed its
+     * agents and their Node objects, and its record goes then, as EKS keeps a node group listed while it terminates
+     * its instances.
+     */
     public Nodegroup deleteNodeGroup(String clusterName, String nodegroupName) {
-        Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
+        String accountId = regionResolver.getAccountId();
+        Object capacityLock = capacityLock(accountId, clusterName);
         Nodegroup nodeGroup;
+        boolean drains;
         synchronized (capacityLock) {
             nodeGroup = describeNodeGroup(clusterName, nodegroupName);
+            Cluster cluster = describeCluster(clusterName);
+            drains = runsNodes(cluster);
             nodeGroup.setStatus(NodegroupStatus.DELETING);
             nodeGroup.setModifiedAt(Instant.now());
-            nodeGroupStorage.delete(nodeGroupKey(clusterName, nodegroupName));
+            nodeGroup.setPendingUpdateId(null);
+            nodeGroup.setPendingVersion(null);
+            nodeGroup.setPendingSince(null);
+            if (drains) {
+                nodeGroupStorage.put(nodeGroupKey(clusterName, nodegroupName), nodeGroup);
+            } else {
+                nodeGroupStorage.delete(nodeGroupKey(clusterName, nodegroupName));
+            }
             if (addons != null) {
-                addons.deleteNodegroupUpdates(describeCluster(clusterName), nodegroupName);
+                addons.deleteNodegroupUpdates(cluster, nodegroupName);
             }
         }
-        syncNodeWhenRunning(clusterName);
+        if (drains) {
+            requestNodes(accountId, clusterName);
+        } else {
+            syncNodeWhenRunning(clusterName);
+        }
         return nodeGroup;
     }
 
@@ -1423,6 +1569,25 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     }
 
     private void completeClusterVersionUpdate(String accountId, Cluster cluster, String updateId, String version) {
+        boolean replacesServerOnly = runsNodes(cluster);
+        if (replacesServerOnly) {
+            nodeReconciler.replacingControlPlane(accountId, cluster.getName(), true);
+        }
+        try {
+            replaceForVersion(accountId, cluster, updateId, version);
+        } finally {
+            if (replacesServerOnly) {
+                nodeReconciler.replacingControlPlane(accountId, cluster.getName(), false);
+            }
+        }
+    }
+
+    /**
+     * Recreates the cluster's k3s server on the new version, keeping volume, port and address. On a multi-node
+     * cluster the agents keep running their kubelet version and reconnect to the new server by themselves, as
+     * managed nodes stay on theirs until their node group is updated; no node work runs meanwhile.
+     */
+    private void replaceForVersion(String accountId, Cluster cluster, String updateId, String version) {
         String previousVersion = cluster.getVersion();
         boolean previousExplicit = cluster.isExplicitVersion();
         String failure = null;
@@ -1575,25 +1740,42 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             nodegroup.setStatus(NodegroupStatus.UPDATING);
             nodegroup.setModifiedAt(Instant.now());
+            if (runsNodes(cluster)) {
+                boolean relabel = change.labels() != null || change.taints() != null;
+                applyConfigChange(nodegroup, change, labels, taints, scaling);
+                nodegroup.setPendingUpdateId(update.id());
+                if (relabel) {
+                    nodegroup.getNodes().forEach(node -> node.setReady(false));
+                }
+            }
             nodeGroupStorage.put(nodeGroupKey(clusterName, nodegroupName), nodegroup);
         }
+        if (runsNodes(cluster)) {
+            requestNodes(accountId, clusterName);
+            return update;
+        }
         Nodegroup updating = nodegroup;
-        Runnable completion = () -> completeNodegroupUpdate(accountId, cluster, updating, update.id(), group -> {
-            group.setLabels(labels);
-            group.setTaints(taints);
-            group.setScalingConfig(scaling);
-            if (change.updateConfig() != null) {
-                group.setUpdateConfig(change.updateConfig());
-            }
-            if (change.nodeRepairConfig() != null) {
-                group.setNodeRepairConfig(change.nodeRepairConfig());
-            }
-            if (change.warmPoolConfig() != null) {
-                group.setWarmPoolConfig(change.warmPoolConfig());
-            }
-        });
+        Runnable completion = () -> completeNodegroupUpdate(accountId, cluster, updating, update.id(),
+                group -> applyConfigChange(group, change, labels, taints, scaling));
         runNodegroupUpdate(accountId, region, cluster, completion);
         return update;
+    }
+
+    private static void applyConfigChange(Nodegroup group, UpdateNodegroupConfigRequest change,
+                                          Map<String, String> labels, List<Object> taints,
+                                          NodegroupScalingConfig scaling) {
+        group.setLabels(labels);
+        group.setTaints(taints);
+        group.setScalingConfig(scaling);
+        if (change.updateConfig() != null) {
+            group.setUpdateConfig(change.updateConfig());
+        }
+        if (change.nodeRepairConfig() != null) {
+            group.setNodeRepairConfig(change.nodeRepairConfig());
+        }
+        if (change.warmPoolConfig() != null) {
+            group.setWarmPoolConfig(change.warmPoolConfig());
+        }
     }
 
     /**
@@ -1640,7 +1822,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         + " cannot be rolled back from version " + current + " to " + version, 400);
             }
             releaseVersion = change.releaseVersion() != null && !change.releaseVersion().isBlank()
-                    ? change.releaseVersion().trim() : version + "-eks-1";
+                    ? change.releaseVersion().trim() : EksNodeLayout.releaseVersion(version);
             List<UpdateParam> params = new ArrayList<>(List.of(new UpdateParam("Version", version),
                     new UpdateParam("ReleaseVersion", releaseVersion)));
             if (change.launchTemplate() != null) {
@@ -1655,7 +1837,20 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
             nodegroup.setStatus(NodegroupStatus.UPDATING);
             nodegroup.setModifiedAt(Instant.now());
+            if (runsNodes(cluster)) {
+                nodegroup.setPendingUpdateId(update.id());
+                nodegroup.setPendingVersion(version);
+                nodegroup.setPendingReleaseVersion(releaseVersion);
+                nodegroup.setPendingLaunchTemplate(change.launchTemplate() == null ? null
+                        : mergedLaunchTemplate(nodegroup, change.launchTemplate()));
+                nodegroup.setPendingForce(Boolean.TRUE.equals(change.force()));
+                nodegroup.setPendingSince(Instant.now());
+            }
             nodeGroupStorage.put(nodeGroupKey(clusterName, nodegroupName), nodegroup);
+        }
+        if (runsNodes(cluster)) {
+            requestNodes(accountId, clusterName);
+            return update;
         }
         Nodegroup updating = nodegroup;
         Runnable completion = () -> completeNodegroupUpdate(accountId, cluster, updating, update.id(), group -> {
@@ -1676,6 +1871,19 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         });
         runNodegroupUpdate(accountId, region, cluster, completion);
         return update;
+    }
+
+    private static Map<String, Object> mergedLaunchTemplate(Nodegroup group, Map<String, Object> change) {
+        Map<String, Object> launchTemplate = new LinkedHashMap<>();
+        if (group.getLaunchTemplate() instanceof Map<?, ?> previous) {
+            previous.forEach((key, value) -> launchTemplate.put(String.valueOf(key), value));
+        }
+        change.forEach((key, value) -> {
+            if (value != null) {
+                launchTemplate.put(key, value);
+            }
+        });
+        return launchTemplate;
     }
 
     private void runNodegroupUpdate(String accountId, String region, Cluster cluster, Runnable completion) {
@@ -2453,6 +2661,129 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     private void startReadinessPoller() {
         poller.scheduleAtFixedRate(this::pollClusterReadiness, 2, 3, TimeUnit.SECONDS);
+        if (nodeReconciler != null) {
+            poller.scheduleAtFixedRate(this::sweepNodes, 5, 3, TimeUnit.SECONDS);
+        }
+    }
+
+    /** The load balancer mode new clusters record: {@code floci.services.eks.load-balancer.mode}. */
+    private String configuredLoadBalancerMode() {
+        EmulatorConfig.EksLoadBalancerConfig loadBalancer = config.services().eks().loadBalancer();
+        return loadBalancer != null && loadBalancer.mode() != null ? loadBalancer.mode()
+                : EksClusterManager.LOAD_BALANCER_EMULATED;
+    }
+
+    /**
+     * Every 3 seconds, a load balancer pass over each running multi-node cluster in the {@code emulated} mode, one
+     * cluster at a time on a thread of its own; a cluster whose last pass still runs is skipped.
+     */
+    void reconcileLoadBalancers() {
+        if (loadBalancerController == null) {
+            return;
+        }
+        for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+            Cluster cluster = entry.value();
+            if (cluster.getStatus() != ClusterStatus.ACTIVE || !runsNodes(cluster)
+                    || !EksClusterManager.LOAD_BALANCER_EMULATED.equals(cluster.getLoadBalancerMode())) {
+                continue;
+            }
+            String key = entry.accountId() + "/" + cluster.getName();
+            // Checked and registered under the lock closeLoadBalancers takes, so a delete either sees this pass and
+            // waits for it, or this pass sees the delete and does not start.
+            synchronized (loadBalancerPasses) {
+                if (loadBalancersClosed.contains(key) || isClusterDeleting(entry.accountId(), cluster)
+                        || !loadBalancerPasses.add(key)) {
+                    continue;
+                }
+            }
+            BooleanSupplier closed = () -> loadBalancersClosed.contains(key) || cluster.getStatus() != ClusterStatus.ACTIVE
+                    || isClusterDeleting(entry.accountId(), cluster);
+            Map<String, String> backends = new LinkedHashMap<>();
+            for (Nodegroup group : listNodeGroupsForCluster(cluster.getName(), entry.accountId())) {
+                for (EksNode node : group.getNodes()) {
+                    if (node.isRunning() && node.getNodeName() != null && node.getClusterIp() != null) {
+                        backends.put(node.getNodeName(), node.getClusterIp());
+                    }
+                }
+            }
+            String region = resolveClusterRegion(cluster);
+            try {
+                loadBalancerRunner.execute(() -> {
+                    try {
+                        RequestScopes.runAs(entry.accountId(), region,
+                                () -> loadBalancerController.reconcile(cluster, region, backends, closed));
+                    } catch (RuntimeException e) {
+                        LOG.warnv(e, "Load balancer pass failed for EKS cluster {0}", cluster.getName());
+                    } finally {
+                        loadBalancerPasses.remove(key);
+                    }
+                });
+            } catch (RuntimeException e) {
+                loadBalancerPasses.remove(key);
+            }
+        }
+    }
+
+    /** At shutdown, before the clusters stop: no pass starts another appliance, and the running one ends. */
+    private void closeAllLoadBalancers() {
+        synchronized (loadBalancerPasses) {
+            for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+                loadBalancersClosed.add(entry.accountId() + "/" + entry.value().getName());
+            }
+        }
+        loadBalancerRunner.shutdown();
+        try {
+            if (!loadBalancerRunner.awaitTermination(60, TimeUnit.SECONDS)) {
+                loadBalancerRunner.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            loadBalancerRunner.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Keeps load balancer passes off a cluster being deleted, and waits for the one running, so no appliance starts
+     * after the cluster's appliances are removed.
+     */
+    private void closeLoadBalancers(String key) {
+        synchronized (loadBalancerPasses) {
+            loadBalancersClosed.add(key);
+        }
+        // A closed pass stops at its next Service, so this waits for at most one appliance or kubectl call.
+        long deadline = System.currentTimeMillis() + LOAD_BALANCER_CLOSE_WAIT_MILLIS;
+        while (loadBalancerPasses.contains(key)) {
+            if (System.currentTimeMillis() >= deadline) {
+                LOG.warnv("A load balancer pass over EKS cluster {0} still runs; deleting the cluster anyway", key);
+                return;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
+     * Retries the clusters whose nodes are not settled, every 3 seconds, and every 30 seconds asks for a pass over
+     * every running multi-node cluster, which recreates dead agents and removes orphans.
+     */
+    void sweepNodes() {
+        try {
+            reconcileLoadBalancers();
+            nodeReconciler.retryUnsettled();
+            if (++nodeSweeps % 10 == 0) {
+                for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+                    if (entry.value().getStatus() == ClusterStatus.ACTIVE && runsNodes(entry.value())) {
+                        nodeReconciler.request(entry.accountId(), entry.value().getName());
+                    }
+                }
+            }
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Error in the EKS node sweep");
+        }
     }
 
     void pollClusterReadiness() {
@@ -2480,6 +2811,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         }
                         reconcileAccessPoliciesAsync(cluster);
                         restoreJoinedInstancesAsync(entry.accountId(), cluster);
+                        if (runsNodes(cluster)) {
+                            requestNodes(entry.accountId(), cluster.getName());
+                        }
                     }
                 } else if (cluster.getStatus() == ClusterStatus.ACTIVE && hasPendingJoinedInstances(cluster)) {
                     restoreJoinedInstancesAsync(entry.accountId(), cluster);
@@ -2546,6 +2880,70 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             aware.putForAccount(cluster.getAccountId(), cluster.getName(), cluster);
         } else {
             storage.put(cluster.getName(), cluster);
+        }
+    }
+
+    /** The node reconciler's view of EKS storage: node groups and clusters under the cluster's capacity lock. */
+    private final class NodeStore implements EksNodeReconciler.Store {
+        @Override
+        public Object lock(String accountId, String clusterName) {
+            return capacityLock(accountId, clusterName);
+        }
+
+        @Override
+        public Optional<Cluster> cluster(String accountId, String clusterName) {
+            return findAuthenticationCluster(accountId, clusterName)
+                    .filter(cluster -> !isClusterDeleting(accountId, cluster));
+        }
+
+        @Override
+        public List<Nodegroup> nodegroups(String accountId, String clusterName) {
+            return listNodeGroupsForCluster(clusterName, accountId).stream()
+                    .sorted(Comparator.comparing(Nodegroup::getCreatedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                            .thenComparing(Nodegroup::getNodegroupName, Comparator.nullsLast(Comparator.naturalOrder())))
+                    .toList();
+        }
+
+        @Override
+        public void save(String accountId, Nodegroup group) {
+            String key = nodeGroupKey(group.getClusterName(), group.getNodegroupName());
+            if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
+                aware.putForAccount(accountId, key, group);
+            } else {
+                nodeGroupStorage.put(key, group);
+            }
+        }
+
+        @Override
+        public void delete(String accountId, Nodegroup group) {
+            String key = nodeGroupKey(group.getClusterName(), group.getNodegroupName());
+            if (nodeGroupStorage instanceof AccountAwareStorageBackend<Nodegroup> aware) {
+                aware.deleteForAccount(accountId, key);
+            } else {
+                nodeGroupStorage.delete(key);
+            }
+        }
+
+        @Override
+        public void saveCluster(String accountId, Cluster cluster) {
+            putClusterForAccount(accountId, cluster);
+        }
+
+        @Override
+        public void finishUpdate(Cluster cluster, String updateId, String errorCode, String failure) {
+            if (addons == null) {
+                return;
+            }
+            addons.finishUpdate(cluster, updateId, failure == null ? "Successful" : "Failed", failure == null
+                    ? List.of() : List.of(new ErrorDetail(errorCode != null ? errorCode : "Unknown", failure,
+                    List.of(cluster.getName()))));
+        }
+
+        @Override
+        public boolean scoped(String accountId, String clusterName, Supplier<Boolean> pass) {
+            String region = findAuthenticationCluster(accountId, clusterName).map(EksService.this::resolveClusterRegion)
+                    .orElse(config.defaultRegion());
+            return RequestScopes.callAs(accountId, region, pass);
         }
     }
 

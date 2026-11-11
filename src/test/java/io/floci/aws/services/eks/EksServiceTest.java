@@ -29,6 +29,7 @@ import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterOidcKey;
 import io.floci.aws.services.eks.model.ClusterStatus;
+import io.floci.aws.services.eks.model.CreateAccessEntryRequest;
 import io.floci.aws.services.eks.model.CreateClusterRequest;
 import io.floci.aws.services.eks.model.CreateFargateProfileRequest;
 import io.floci.aws.services.eks.model.CreateNodeGroupRequest;
@@ -51,6 +52,7 @@ import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.ArgumentCaptor;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -957,8 +959,8 @@ class EksServiceTest {
         CreateNodeGroupRequest nodeGroupRequest = new CreateNodeGroupRequest();
         nodeGroupRequest.setNodegroupName("my-eks-nodegroup");
         nodeGroupRequest.setNodeRole("arn:aws:iam::000000000000:role/role-name");
-        nodeGroupRequest.setVersion("1.26");
-        nodeGroupRequest.setReleaseVersion("1.26.12-20240329");
+        nodeGroupRequest.setVersion("1.29");
+        nodeGroupRequest.setReleaseVersion("1.29.15-20240329");
         nodeGroupRequest.setScalingConfig(scalingConfig);
         nodeGroupRequest.setSubnets(List.of("subnet-0e2907431c9988b72", "subnet-04ad87f71c6e5ab4d"));
         nodeGroupRequest.setInstanceTypes(List.of("t3.medium"));
@@ -985,6 +987,59 @@ class EksServiceTest {
         assertEquals("my-eks-nodegroup", eksService.listNodeGroups("my-eks-cluster").getFirst());
     }
 
+    // "It's unnecessary to create an access entry for an IAM role that's used for a managed node group [...]
+    // EKS will create access entries (if enabled)."
+    // https://docs.aws.amazon.com/eks/latest/userguide/creating-access-entries.html
+    @Test
+    void createNodeGroupGivesTheNodeRoleAnAccessEntryWhenAccessEntriesAreOn() {
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), entries);
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName("api-cluster");
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        request.setAccessConfig(new AccessConfig("API_AND_CONFIG_MAP", true));
+        service.createCluster(request);
+
+        service.createNodeGroup("api-cluster", nodeGroupRequest("workers"));
+
+        ArgumentCaptor<CreateAccessEntryRequest> entry = ArgumentCaptor.forClass(CreateAccessEntryRequest.class);
+        verify(entries).create(any(Cluster.class), entry.capture());
+        assertEquals("arn:aws:iam::000000000000:role/role-name", entry.getValue().principalArn());
+        assertEquals("EC2_LINUX", entry.getValue().type());
+    }
+
+    @Test
+    void createNodeGroupLeavesAccessEntriesAloneInAConfigMapCluster() {
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), entries);
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName("configmap-cluster");
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        service.createCluster(request);
+
+        service.createNodeGroup("configmap-cluster", nodeGroupRequest("workers"));
+
+        verify(entries, never()).create(any(), any());
+    }
+
+    @Test
+    void createNodeGroupSucceedsWhenTheNodeRoleCannotHaveAnAccessEntry() {
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        when(entries.create(any(), any())).thenThrow(new AwsException("InvalidParameterException",
+                "IAM role does not exist", 400));
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), entries);
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName("api-only");
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        request.setAccessConfig(new AccessConfig("API", true));
+        service.createCluster(request);
+
+        assertEquals(NodegroupStatus.ACTIVE, service.createNodeGroup("api-only", nodeGroupRequest("workers")).getStatus());
+    }
+
     @Test
     void createNodeGroupDefaultsVersionFromCluster() {
         CreateClusterRequest clusterRequest = new CreateClusterRequest();
@@ -996,7 +1051,23 @@ class EksServiceTest {
         Nodegroup nodeGroup = eksService.createNodeGroup("my-eks-cluster", nodeGroupRequest("my-eks-nodegroup"));
 
         assertEquals("1.30", nodeGroup.getVersion());
-        assertEquals("1.30-eks-1", nodeGroup.getReleaseVersion());
+        assertEquals(EksNodeLayout.releaseVersion("1.30"), nodeGroup.getReleaseVersion());
+        assertTrue(nodeGroup.getReleaseVersion().matches("1\\.30\\.\\d+-\\d{8}"), nodeGroup.getReleaseVersion());
+        assertEquals("AL2023_x86_64_STANDARD", nodeGroup.getAmiType());
+    }
+
+    // "By default, the Kubernetes version of the cluster is used, and this is the only accepted specified value."
+    // https://docs.aws.amazon.com/eks/latest/APIReference/API_CreateNodegroup.html
+    @Test
+    void createNodeGroupRefusesAVersionOtherThanTheClusters() {
+        createTestCluster("version-cluster");
+        CreateNodeGroupRequest request = nodeGroupRequest("older");
+        request.setVersion("1.28");
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> eksService.createNodeGroup("version-cluster", request));
+
+        assertEquals("InvalidParameterException", refused.getErrorCode());
     }
 
     @Test
@@ -1181,11 +1252,13 @@ class EksServiceTest {
         assertTrue(createdStorage("eks-nodegroups.json").get("kept-during-swap/first").isPresent());
     }
 
+    /** A cluster as round 1 stored it: one k3s container that is the node too, which keeps its single-node behavior. */
     private static Cluster activeClusterWithRunningNode(EksService service, String name) {
         CreateClusterRequest request = new CreateClusterRequest();
         request.setName(name);
         request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
         Cluster cluster = service.createCluster(request);
+        cluster.setTopology(null);
         cluster.setContainerId("existing-container");
         cluster.setStatus(ClusterStatus.ACTIVE);
         return cluster;
@@ -1266,6 +1339,7 @@ class EksServiceTest {
         request.setName("concurrent-capacity");
         request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
         Cluster cluster = service.createCluster(request);
+        cluster.setTopology(null);
         cluster.setContainerId("existing-container");
 
         ExecutorService executor = Executors.newFixedThreadPool(2);

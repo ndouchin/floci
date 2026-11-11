@@ -874,7 +874,14 @@ floci:
       irsa-signing-key: true       # sign k3s service account tokens with the cluster OIDC key
       pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials (needs floci.tls.enabled)
       embedded-dns: true           # point cluster containers at Floci's embedded DNS to resolve Route 53 private zones
-      vpc-route-programming: true  # program VPC routes into the cluster container for associated subnets
+      vpc-route-programming: true  # program VPC routes into the cluster's node containers for associated subnets
+      max-nodes-per-cluster: 5     # k3s agents run per cluster across its node groups; nodes past it have no agent (0 = no cap)
+      node-ready-timeout-seconds: 900 # a node group not Ready by then is CREATE_FAILED (NodeCreationFailure), as on EKS
+      node-drain-timeout-seconds: 900 # a node not drained by then fails a version update (PodEvictionFailure) unless forced
+      load-balancer:
+        mode: emulated             # emulated (EKS-shaped hostnames, an appliance per Service) | servicelb | off; recorded per new cluster
+        provisioning-delay-seconds: 0 # how long a new load balancer takes to get its hostname
+        host-ports: dynamic        # dynamic | same-as-service | none: the 127.0.0.1 port the Docker host reaches each Service port at
     mwaa:
       enabled: true
       mock: false
@@ -1117,6 +1124,7 @@ floci:
     servicequotas:
       enabled: true
       standard-on-demand-vcpus: 5
+      # applied-values: ec2/L-1216C47A=100,vpc/L-F678F1CE=10  # applied values that differ from AWS's defaults
     verifiedpermissions:
       enabled: true
       # cedar-url: http://floci-cedar:8180  # set to skip sidecar container management

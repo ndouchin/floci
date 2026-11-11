@@ -1,11 +1,13 @@
 package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.eks.EksService;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.CreateClusterRequest;
 import io.floci.aws.services.eks.model.Nodegroup;
+import io.floci.aws.services.eks.model.NodegroupStatus;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -24,11 +26,23 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
     private static final String CLUSTER = "AWS::EKS::Cluster";
     private static final String NODEGROUP = "AWS::EKS::Nodegroup";
 
+    // EKS gives a node 15 minutes to join; CloudFormation waits for the node group past that.
+    private static final long DEFAULT_WAIT_MILLIS = 20 * 60 * 1000L;
+    private static final long DEFAULT_POLL_MILLIS = 2000L;
+
     private final EksService eksService;
+    private final long pollMillis;
+    private final long waitMillis;
 
     @Inject
     public EksCfnProvisioner(EksService eksService) {
+        this(eksService, DEFAULT_POLL_MILLIS, DEFAULT_WAIT_MILLIS);
+    }
+
+    EksCfnProvisioner(EksService eksService, long pollMillis, long waitMillis) {
         this.eksService = eksService;
+        this.pollMillis = pollMillis;
+        this.waitMillis = waitMillis;
     }
 
     @Override
@@ -82,6 +96,9 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         request.setSubnets(ctx.resolveStringList(props, "Subnets"));
 
         Nodegroup nodegroup = eksService.createNodeGroup(clusterName, request);
+        if (nodegroup.getStatus() == NodegroupStatus.CREATING) {
+            awaitActive(clusterName, nodegroupName);
+        }
         // Ref (and the readOnly Id) is the composite the registry primary identifier declares,
         // clusterName/nodegroupName, matching AWS. The plain names stay as their own attributes:
         // ClusterName and NodegroupName back delete() and Fn::GetAtt.
@@ -92,6 +109,61 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put("NodegroupName", nodegroup.getNodegroupName());
         if (nodegroup.getNodegroupArn() != null) {
             r.getAttributes().put("Arn", nodegroup.getNodegroupArn());
+        }
+    }
+
+    /**
+     * A node group on a cluster that runs its nodes is CREATING until they are Ready; CloudFormation reports the
+     * resource created only once it is ACTIVE, and failed when it is CREATE_FAILED.
+     */
+    private void awaitActive(String clusterName, String nodegroupName) {
+        long deadline = System.currentTimeMillis() + waitMillis;
+        while (true) {
+            Nodegroup current = eksService.describeNodeGroup(clusterName, nodegroupName);
+            NodegroupStatus status = current == null ? NodegroupStatus.ACTIVE : current.getStatus();
+            if (status == NodegroupStatus.ACTIVE) {
+                return;
+            }
+            if (status != NodegroupStatus.CREATING) {
+                throw new IllegalStateException("EKS node group " + nodegroupName + " of cluster " + clusterName
+                        + " is " + status);
+            }
+            if (System.currentTimeMillis() > deadline) {
+                throw new IllegalStateException("EKS node group " + nodegroupName + " of cluster " + clusterName
+                        + " is still CREATING after " + waitMillis / 1000 + " seconds");
+            }
+            pause();
+        }
+    }
+
+    /** A deleted node group is DELETING until its nodes are gone; the cluster it belongs to cannot go before. */
+    private void awaitDeleted(String clusterName, String nodegroupName) {
+        long deadline = System.currentTimeMillis() + waitMillis;
+        while (true) {
+            try {
+                if (eksService.describeNodeGroup(clusterName, nodegroupName) == null) {
+                    return;
+                }
+            } catch (AwsException e) {
+                if ("ResourceNotFoundException".equals(e.getErrorCode())) {
+                    return;
+                }
+                throw e;
+            }
+            if (System.currentTimeMillis() > deadline) {
+                throw new IllegalStateException("EKS node group " + nodegroupName + " of cluster " + clusterName
+                        + " is still DELETING after " + waitMillis / 1000 + " seconds");
+            }
+            pause();
+        }
+    }
+
+    private void pause() {
+        try {
+            Thread.sleep(pollMillis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for an EKS node group", e);
         }
     }
 
@@ -111,6 +183,7 @@ public class EksCfnProvisioner implements CfnResourceProvisioner {
                     CfnDeletes.safeDelete("EKS nodegroup", resource.getPhysicalId(),
                             () -> eksService.deleteNodeGroup(clusterName, nodegroupName),
                             "ResourceNotFoundException");
+                    awaitDeleted(clusterName, nodegroupName);
                 }
             }
             default -> {

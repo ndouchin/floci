@@ -73,7 +73,7 @@ class EksUpdatesIntegrationTest {
                     .post("/clusters/" + cluster + "/node-groups/" + nodegroup + "/update-version").then().statusCode(200)
                     .body("update.type", equalTo("VersionUpdate"))
                     .body("update.params.type", contains("Version", "ReleaseVersion"))
-                    .body("update.params.value", contains("1.31", "1.31-eks-1"))
+                    .body("update.params.value", contains("1.31", EksNodeLayout.releaseVersion("1.31")))
                     .extract().path("update.id");
             given().queryParam("nodegroupName", nodegroup)
                     .get("/clusters/" + cluster + "/updates/" + nodegroupUpdate).then().statusCode(200)
@@ -81,7 +81,7 @@ class EksUpdatesIntegrationTest {
             given().get("/clusters/" + cluster + "/node-groups/" + nodegroup).then().statusCode(200)
                     .body("nodegroup.status", equalTo("ACTIVE"))
                     .body("nodegroup.version", equalTo("1.31"))
-                    .body("nodegroup.releaseVersion", equalTo("1.31-eks-1"));
+                    .body("nodegroup.releaseVersion", equalTo(EksNodeLayout.releaseVersion("1.31")));
             given().contentType(JSON).body(Map.of("version", "1.30"))
                     .post("/clusters/" + cluster + "/node-groups/" + nodegroup + "/update-version").then().statusCode(400)
                     .body("__type", equalTo("InvalidParameterException"));

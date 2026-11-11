@@ -63,7 +63,7 @@ class ServiceQuotasAppliedValueIntegrationTest {
         quotaRequest("GetAWSDefaultServiceQuota", "{\"ServiceCode\":\"ec2\",\"QuotaCode\":\"" + CODE + "\"}", region)
                 .then().statusCode(200).body("Quota.Value", equalTo(5.0f));
         quotaRequest("ListAWSDefaultServiceQuotas", "{\"ServiceCode\":\"ec2\"}", region)
-                .then().statusCode(200).body("Quotas.size()", equalTo(4))
+                .then().statusCode(200).body("Quotas.size()", equalTo(5))
                 .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.Value", equalTo(5.0f));
     }
 
@@ -77,8 +77,8 @@ class ServiceQuotasAppliedValueIntegrationTest {
         String token = first.path("NextToken");
         Response rest = quotaRequest(action,
                 "{\"ServiceCode\":\"ec2\",\"NextToken\":\"" + token + "\"}", "us-east-1")
-                .then().statusCode(200).body("Quotas.size()", equalTo(3)).extract().response();
-        assertEquals(List.of(5000.0f, 5000.0f, 5000.0f), rest.path("Quotas.Value"));
+                .then().statusCode(200).body("Quotas.size()", equalTo(4)).extract().response();
+        assertEquals(List.of(5.0f, 5000.0f, 5000.0f, 5000.0f), rest.path("Quotas.Value"));
         assertNull(rest.path("NextToken"));
     }
 

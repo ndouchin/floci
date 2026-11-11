@@ -78,7 +78,11 @@ class EksLaunchTemplateUserDataTest {
         CreateClusterRequest clusterReq = new CreateClusterRequest();
         clusterReq.setName(CLUSTER_NAME);
         clusterReq.setRoleArn("arn:aws:iam::" + ACCOUNT + ":role/eks-role");
-        eksService.createCluster(clusterReq);
+        // A cluster as round 1 stored it, whose single node runs launch template user data once per cluster.
+        // A multi-node cluster runs it on each node it launches (EksNodeAgents).
+        Cluster cluster = eksService.createCluster(clusterReq);
+        cluster.setTopology(null);
+        eksService.putClusterForAccount(ACCOUNT, cluster);
     }
 
     @Test
@@ -450,7 +454,7 @@ class EksLaunchTemplateUserDataTest {
         CreateClusterRequest clusterReq = new CreateClusterRequest();
         clusterReq.setName(CLUSTER_NAME);
         clusterReq.setRoleArn("arn:aws:iam::" + ACCOUNT + ":role/eks-role");
-        eksService.createCluster(clusterReq);
+        eksService.createCluster(clusterReq).setTopology(null);
 
         // Nodegroup on recreated cluster should execute user data again
         eksService.createNodeGroup(CLUSTER_NAME, req);
@@ -478,7 +482,7 @@ class EksLaunchTemplateUserDataTest {
         CreateClusterRequest clusterReq = new CreateClusterRequest();
         clusterReq.setName(CLUSTER_NAME);
         clusterReq.setRoleArn("arn:aws:iam::" + ACCOUNT + ":role/eks-role");
-        eksService.createCluster(clusterReq);
+        eksService.createCluster(clusterReq).setTopology(null);
 
         // Nodegroup on recreated cluster should execute user data again
         eksService.createNodeGroup(CLUSTER_NAME, req);

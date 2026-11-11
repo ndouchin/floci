@@ -153,6 +153,62 @@ public class Cluster {
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private Boolean metricsServer;
 
+    public static final String AGENTLESS_TOPOLOGY = "agentless";
+
+    /**
+     * How the cluster runs: {@code agentless} for a k3s server playing the control plane and one k3s agent per
+     * managed node; null for a cluster stored before that, which keeps its single node. Internal persisted
+     * metadata, left out of API responses, as the fields below.
+     */
+    @JsonProperty("topology")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String topology;
+
+    /** The token k3s agents join the server with, read from its data volume. */
+    @JsonProperty("joinToken")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String joinToken;
+
+    /** The cluster's own Docker network, where its server and agents find each other. */
+    @JsonProperty("nodeNetwork")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String nodeNetwork;
+
+    @JsonProperty("nodeSubnet")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String nodeSubnet;
+
+    /** The fixed address of the server on the cluster network, which it advertises to the agents. */
+    @JsonProperty("serverAddress")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String serverAddress;
+
+    /** How Services of type LoadBalancer get their address: emulated, servicelb or off. */
+    @JsonProperty("loadBalancerMode")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String loadBalancerMode;
+
+    public String getTopology() { return topology; }
+    public void setTopology(String topology) { this.topology = topology; }
+
+    @JsonIgnore
+    public boolean isAgentless() { return AGENTLESS_TOPOLOGY.equals(topology); }
+
+    public String getJoinToken() { return joinToken; }
+    public void setJoinToken(String joinToken) { this.joinToken = joinToken; }
+
+    public String getNodeNetwork() { return nodeNetwork; }
+    public void setNodeNetwork(String nodeNetwork) { this.nodeNetwork = nodeNetwork; }
+
+    public String getNodeSubnet() { return nodeSubnet; }
+    public void setNodeSubnet(String nodeSubnet) { this.nodeSubnet = nodeSubnet; }
+
+    public String getServerAddress() { return serverAddress; }
+    public void setServerAddress(String serverAddress) { this.serverAddress = serverAddress; }
+
+    public String getLoadBalancerMode() { return loadBalancerMode; }
+    public void setLoadBalancerMode(String loadBalancerMode) { this.loadBalancerMode = loadBalancerMode; }
+
     public String getCreatorArn() { return creatorArn; }
     public void setCreatorArn(String creatorArn) { this.creatorArn = creatorArn; }
 
@@ -292,6 +348,12 @@ public class Cluster {
         c.accessConfig = this.accessConfig;
         c.creatorArn = this.creatorArn;
         c.metricsServer = this.metricsServer;
+        c.topology = this.topology;
+        c.joinToken = this.joinToken;
+        c.nodeNetwork = this.nodeNetwork;
+        c.nodeSubnet = this.nodeSubnet;
+        c.serverAddress = this.serverAddress;
+        c.loadBalancerMode = this.loadBalancerMode;
         return c;
     }
 }

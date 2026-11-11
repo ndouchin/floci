@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.ServiceQuotasStartupValidator;
 import io.floci.aws.core.common.AvailabilityZoneIds;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
@@ -441,6 +442,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             allocated.ifPresent(address -> containerPrivateIps
                     .computeIfAbsent(key(region, subnetId), ignored -> new HashSet<>()).add(address));
             return allocated;
+        }
+    }
+
+    /**
+     * Leases {@code address} of a Docker-backed subnet again for a holder that kept it across a restart, which empties
+     * the in-memory lease table while its container goes on holding the address; false when the subnet is not
+     * Docker-backed, the address is outside its range, or another holder has it.
+     */
+    public boolean claimVpcPrivateIp(String region, String subnetId, String address) {
+        if (vpcNetworkManager == null || address == null) {
+            return false;
+        }
+        synchronized (privateIpAllocationLock) {
+            boolean claimed = vpcNetworkManager.claimPrivateIp(region, subnetId, address);
+            if (claimed) {
+                containerPrivateIps.computeIfAbsent(key(region, subnetId), ignored -> new HashSet<>()).add(address);
+            }
+            return claimed;
         }
     }
 
@@ -5446,8 +5465,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private int appliedStandardOnDemandLimit() {
-        return config.services().servicequotas() == null ? 5
-                : config.services().servicequotas().standardOnDemandVcpus();
+        EmulatorConfig.ServiceQuotasServiceConfig quotas = config.services().servicequotas();
+        if (quotas == null) {
+            return 5;
+        }
+        Double applied = quotas.appliedValues() == null ? null
+                : ServiceQuotasStartupValidator.parseAppliedValues(quotas.appliedValues()).get("ec2/L-1216C47A");
+        return applied != null ? (int) Math.min(Integer.MAX_VALUE, Math.floor(applied)) : quotas.standardOnDemandVcpus();
     }
 
     private int admittedInstanceCount(String region, String instanceType, int minimum, int maximum) {

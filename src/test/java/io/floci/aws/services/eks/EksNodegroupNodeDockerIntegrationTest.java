@@ -26,13 +26,13 @@ import java.util.function.Predicate;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Drives one real k3s cluster through the EKS API and checks what a managed node group puts on
- * the node it runs on: its labels and taints, kept current by UpdateNodegroupConfig.
+ * its node: its labels and taints at registration, kept current by UpdateNodegroupConfig, and
+ * the node gone with its node group.
  */
 @QuarkusTest
 @TestProfile(EksRuntimeDockerProfile.class)
@@ -73,7 +73,7 @@ class EksNodegroupNodeDockerIntegrationTest {
                 .body("{\"name\":\"" + clusterName + "\",\"roleArn\":\"arn:aws:iam::000000000000:role/eks\"}")
                 .when().post("/clusters")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteCluster(clusterName));
+        cleanup.register(() -> EksDockerNodegroups.teardown(eksService, clusterName));
         waitForClusterStatus(clusterName, ClusterStatus.ACTIVE);
 
         given().contentType(JSON)
@@ -88,7 +88,7 @@ class EksNodegroupNodeDockerIntegrationTest {
                         """.formatted(nodegroupName))
                 .when().post("/clusters/" + clusterName + "/node-groups")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteNodeGroup(clusterName, nodegroupName));
+        EksDockerNodegroups.awaitActive(clusterName, nodegroupName);
 
         JsonNode node = waitForNode(clusterName, n -> "payments".equals(label(n, "team"))
                 && hasTaint(n, "dedicated", "batch", "NoSchedule"));
@@ -113,9 +113,21 @@ class EksNodegroupNodeDockerIntegrationTest {
 
         given().when().delete("/clusters/" + clusterName + "/node-groups/" + nodegroupName)
                 .then().statusCode(200);
-        node = waitForNode(clusterName, n -> label(n, "eks.amazonaws.com/nodegroup") == null);
-        assertNull(label(node, "tier"));
-        assertNoTaint(node, "gpu");
+        waitForNoNode(clusterName);
+    }
+
+    private void waitForNoNode(String clusterName) throws Exception {
+        long deadline = System.currentTimeMillis() + 180_000;
+        while (System.currentTimeMillis() < deadline) {
+            Cluster cluster = eksService.describeCluster(clusterName);
+            ContainerExec.Result result = ContainerExec.run(dockerClient, cluster.getContainerId(),
+                    new String[]{"kubectl", "get", "nodes", "-o", "json"}, 20);
+            if (result.exitCode() == 0 && MAPPER.readTree(result.stdout()).path("items").isEmpty()) {
+                return;
+            }
+            Thread.sleep(2000);
+        }
+        fail("The node group's node was not removed with it");
     }
 
     private void waitForClusterStatus(String clusterName, ClusterStatus status) throws InterruptedException {

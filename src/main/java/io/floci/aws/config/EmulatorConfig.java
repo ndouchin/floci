@@ -1199,6 +1199,12 @@ public interface EmulatorConfig {
 
         @WithDefault("5")
         int standardOnDemandVcpus();
+
+        /**
+         * Applied values that differ from AWS's defaults, as {@code <serviceCode>/<quotaCode>=<value>} entries, for
+         * example {@code ec2/L-1216C47A=100}. AWS defaults stay what GetAWSDefaultServiceQuota returns.
+         */
+        Optional<List<String>> appliedValues();
     }
 
     interface VerifiedPermissionsServiceConfig {
@@ -3900,6 +3906,51 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean vpcRouteProgramming();
+
+        /**
+         * The most nodes Floci runs as k3s agents per cluster, across its managed node groups in creation
+         * order. Nodes past it keep their record and count in the API, with no agent; 0 means no cap.
+         */
+        @WithDefault("5")
+        int maxNodesPerCluster();
+
+        /**
+         * How long a node group waits for its nodes to be Ready before it is CREATE_FAILED with a
+         * NodeCreationFailure issue. EKS gives a node 15 minutes to join.
+         */
+        @WithDefault("900")
+        int nodeReadyTimeoutSeconds();
+
+        /**
+         * How long a node group version update waits for a node to drain before it fails with a
+         * PodEvictionFailure issue, unless the update is forced. EKS waits 15 minutes.
+         */
+        @WithDefault("900")
+        int nodeDrainTimeoutSeconds();
+
+        /** How Services of type LoadBalancer get their address on the clusters created from now on. */
+        EksLoadBalancerConfig loadBalancer();
+    }
+
+    interface EksLoadBalancerConfig {
+        /**
+         * {@code emulated} (k3s's servicelb off; Floci writes EKS-shaped hostnames to the Service status and runs an
+         * appliance container per Service), {@code servicelb} (k3s's servicelb writes node addresses, as before), or
+         * {@code off} (Services stay pending). Recorded on each cluster when it is created.
+         */
+        @WithDefault("emulated")
+        String mode();
+
+        /** How long a new load balancer takes to get its hostname. */
+        @WithDefault("0")
+        int provisioningDelaySeconds();
+
+        /**
+         * Which {@code 127.0.0.1} port the Docker host reaches each Service port at: {@code dynamic} (any free port),
+         * {@code same-as-service} (the Service's port when free), or {@code none}.
+         */
+        @WithDefault("dynamic")
+        String hostPorts();
     }
 
     /**

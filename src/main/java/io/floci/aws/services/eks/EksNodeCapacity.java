@@ -40,6 +40,12 @@ final class EksNodeCapacity {
      */
     static Limits calculate(CatalogInstanceType type, long hostMemoryBytes, int hostCpus,
                             int maxMemoryMib, int maxVcpus) {
+        return calculate(type, EksNodeLayout.maxPods(type), hostMemoryBytes, hostCpus, maxMemoryMib, maxVcpus);
+    }
+
+    /** {@link #calculate} for a node whose pod capacity is {@code maxPods}, the smallest of its node group's types. */
+    static Limits calculate(CatalogInstanceType type, int maxPods, long hostMemoryBytes, int hostCpus,
+                            int maxMemoryMib, int maxVcpus) {
         if (hostMemoryBytes <= 0 || hostCpus <= 0 || maxMemoryMib < 0 || maxVcpus < 0) {
             return null;
         }
@@ -58,15 +64,6 @@ final class EksNodeCapacity {
             return null;
         }
 
-        int interfaces = type.networkCards.stream()
-                .filter(card -> card.networkCardIndex != null && card.networkCardIndex == 0
-                        && card.maximumNetworkInterfaces != null)
-                .mapToInt(card -> card.maximumNetworkInterfaces)
-                .findFirst().orElse(0);
-        int addresses = type.ipv4AddressesPerInterface == null ? 0 : type.ipv4AddressesPerInterface;
-        int podCap = type.vcpu > 30 ? 250 : 110;
-        int maxPods = interfaces > 0 && addresses > 0
-                ? Math.min(podCap, interfaces * (addresses - 1) + 2) : podCap;
         long kubeMemoryMib = 11L * maxPods + 255;
         long systemMemoryMib = Math.max(128, memoryMib / 10);
         long evictionBufferMib = Math.min(100, memoryMib / 4);

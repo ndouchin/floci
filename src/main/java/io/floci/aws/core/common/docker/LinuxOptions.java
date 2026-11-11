@@ -20,6 +20,10 @@ import java.util.Map;
  * @param memorySwapBytes memory plus swap the container may use, in bytes; equal to the memory
  *        limit means no swap (null = daemon default)
  * @param memorySwappiness swappiness from 0 to 100 (null = daemon default)
+ * @param sysctls namespaced kernel parameters set in the container ({@code --sysctl})
+ * @param dnsSearch search domains of the container's resolver ({@code --dns-search}); empty leaves the daemon's,
+ *        which copies the host's
+ * @param dnsOptions options of the container's resolver ({@code --dns-option}); empty leaves the daemon's
  */
 public record LinuxOptions(
         List<String> capAdd,
@@ -28,8 +32,23 @@ public record LinuxOptions(
         Long shmSizeBytes,
         Map<String, String> tmpfs,
         Long memorySwapBytes,
-        Long memorySwappiness
+        Long memorySwappiness,
+        Map<String, String> sysctls,
+        List<String> dnsSearch,
+        List<String> dnsOptions
 ) {
     public static final LinuxOptions NONE =
-            new LinuxOptions(List.of(), List.of(), List.of(), null, Map.of(), null, null);
+            new LinuxOptions(List.of(), List.of(), List.of(), null, Map.of(), null, null, Map.of(), List.of(), List.of());
+
+    public LinuxOptions {
+        if (sysctls == null) {
+            sysctls = Map.of();
+        }
+        if (dnsSearch == null) {
+            dnsSearch = List.of();
+        }
+        if (dnsOptions == null) {
+            dnsOptions = List.of();
+        }
+    }
 }

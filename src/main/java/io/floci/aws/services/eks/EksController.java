@@ -110,11 +110,14 @@ public class EksController {
      * across restarts and must not be included on the wire. Clearing it on a copy
      * causes Jackson to omit the property due to @JsonInclude(NON_DEFAULT).
      */
-    private Cluster toClusterResponse(Cluster cluster) {
+    static Cluster toClusterResponse(Cluster cluster) {
         if (cluster == null || (!cluster.isExplicitVersion() && cluster.getNodeInstanceType() == null
                 && cluster.getClusterArgs() == null && cluster.getDefaultStorageClass() == null
                 && cluster.getJoinedInstanceIds() == null && cluster.getCreatorArn() == null
-                && cluster.getMetricsServer() == null)) {
+                && cluster.getMetricsServer() == null && cluster.getTopology() == null
+                && cluster.getJoinToken() == null && cluster.getNodeNetwork() == null
+                && cluster.getNodeSubnet() == null && cluster.getServerAddress() == null
+                && cluster.getLoadBalancerMode() == null)) {
             return cluster;
         }
         Cluster response = cluster.copy();
@@ -125,7 +128,18 @@ public class EksController {
         response.setJoinedInstanceIds(null);
         response.setCreatorArn(null);
         response.setMetricsServer(null);
+        response.setTopology(null);
+        response.setJoinToken(null);
+        response.setNodeNetwork(null);
+        response.setNodeSubnet(null);
+        response.setServerAddress(null);
+        response.setLoadBalancerMode(null);
         return response;
+    }
+
+    /** The node group as the API shows it: without the nodes and pending update state Floci keeps on the record. */
+    static Nodegroup toNodegroupResponse(Nodegroup nodegroup) {
+        return nodegroup == null || !nodegroup.hasInternalState() ? nodegroup : nodegroup.withoutInternalState();
     }
 
     // Keep these concrete EKS resource paths declared explicitly so they outrank
@@ -134,7 +148,7 @@ public class EksController {
     @Path("/clusters/{name}/node-groups")
     public Response createNodeGroup(@PathParam("name") String name, CreateNodeGroupRequest request) {
         Nodegroup nodeGroup = eksService.createNodeGroup(name, request);
-        return Response.ok(Map.of("nodegroup", nodeGroup)).build();
+        return Response.ok(Map.of("nodegroup", toNodegroupResponse(nodeGroup))).build();
     }
 
     @GET
@@ -149,7 +163,7 @@ public class EksController {
     public Response describeNodeGroup(@PathParam("name") String name,
             @PathParam("nodegroupName") String nodegroupName) {
         Nodegroup nodeGroup = eksService.describeNodeGroup(name, nodegroupName);
-        return Response.ok(Map.of("nodegroup", nodeGroup)).build();
+        return Response.ok(Map.of("nodegroup", toNodegroupResponse(nodeGroup))).build();
     }
 
     @DELETE
@@ -157,7 +171,7 @@ public class EksController {
     public Response deleteNodeGroup(@PathParam("name") String name,
             @PathParam("nodegroupName") String nodegroupName) {
         Nodegroup nodeGroup = eksService.deleteNodeGroup(name, nodegroupName);
-        return Response.ok(Map.of("nodegroup", nodeGroup)).build();
+        return Response.ok(Map.of("nodegroup", toNodegroupResponse(nodeGroup))).build();
     }
 
     @POST

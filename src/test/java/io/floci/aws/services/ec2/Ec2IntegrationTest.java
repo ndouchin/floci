@@ -1176,6 +1176,27 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(17)
+    void describeGpuInstanceTypeReportsItsGpus() {
+        given()
+            .formParam("Action", "DescribeInstanceTypes")
+            .formParam("InstanceType.1", "g5.12xlarge")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.gpuInfo.gpus.item.name", equalTo("A10G"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.gpuInfo.gpus.item.manufacturer",
+                    equalTo("NVIDIA"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.gpuInfo.gpus.item.count", equalTo("4"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.gpuInfo.gpus.item.memoryInfo.sizeInMiB",
+                    equalTo("24576"))
+            .body("DescribeInstanceTypesResponse.instanceTypeSet.item.gpuInfo.totalGpuMemoryInMiB",
+                    equalTo("98304"));
+    }
+
+    @Test
     @Order(18)
     void describeLargeGravitonInstanceTypes() {
         given()
