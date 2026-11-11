@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
@@ -57,11 +58,29 @@ public class ServiceQuotasService {
             Map.entry("sns", "Amazon Simple Notification Service (Amazon SNS)"),
             Map.entry("sqs", "Amazon Simple Queue Service (Amazon SQS)"),
             Map.entry("ec2", "Amazon Elastic Compute Cloud (Amazon EC2)"),
+            Map.entry("ebs", "Amazon Elastic Block Store (Amazon EBS)"),
+            Map.entry("elasticloadbalancing", "Elastic Load Balancing (ELB)"),
             Map.entry("vpc", "Amazon Virtual Private Cloud (Amazon VPC)"),
             Map.entry("dynamodb", "Amazon DynamoDB"),
             Map.entry("logs", "Amazon CloudWatch Logs"),
             Map.entry("events", "Amazon EventBridge (CloudWatch Events)"));
 
+    /**
+     * The regions whose EBS gp2 and io1 storage quotas default to 50 TiB; every other region's default is 300 TiB.
+     * https://docs.aws.amazon.com/general/latest/gr/ebs-service.html
+     */
+    private static final Set<String> EBS_50_TIB_REGIONS = Set.of("us-east-1", "us-east-2", "us-west-1", "us-west-2",
+            "ap-northeast-1", "ap-northeast-2", "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ca-central-1",
+            "eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3", "sa-east-1");
+    private static final double EBS_STORAGE_ELSEWHERE_TIB = 300.0;
+    private static final Set<String> EBS_STORAGE_QUOTAS = Set.of("L-D18FCD1D", "L-FD252861");
+
+    /**
+     * Quotas with their real AWS codes and default values where tooling depends on them, among them every quota
+     * {@code rosa create account-roles} and {@code rosa verify quota} check (rosa v1.2.68 {@code pkg/aws/quota.go},
+     * and IAM's managed policies per role in {@code pkg/policy/policy_service.go}). A new AWS account fails rosa's
+     * check on the On-Demand Standard instances vCPU quota, and so does Floci with its defaults.
+     */
     private static final Map<String, List<QuotaDefinition>> CURATED_QUOTAS = Map.of(
             "codebuild", List.of(
                     new QuotaDefinition("L-2DC20C30", "Concurrently running builds", GENERIC_QUOTA_VALUE, false)),
@@ -71,12 +90,34 @@ public class ServiceQuotasService {
                     new QuotaDefinition("L-E619E033", "Maximum number of accounts", 50.0, true)),
             "ec2", List.of(
                     new QuotaDefinition("L-1216C47A",
-                            "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances", 5.0, false)),
+                            "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances", 5.0, false),
+                    // https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html
+                    new QuotaDefinition("L-0263D0A3", "EC2-VPC Elastic IPs", 5.0, false)),
             // AWS default values: tooling such as Terraform's aws_servicequotas_service_quota
             // compares its desired value against these before requesting an increase.
+            // https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html
             "vpc", List.of(
                     new QuotaDefinition("L-FE5A380F", "NAT gateways per Availability Zone", 5.0, false),
-                    new QuotaDefinition("L-2AEEBF1A", "Rules per network ACL", 20.0, false)));
+                    new QuotaDefinition("L-2AEEBF1A", "Rules per network ACL", 20.0, false),
+                    new QuotaDefinition("L-F678F1CE", "VPCs per Region", 5.0, false),
+                    new QuotaDefinition("L-A4707A72", "Internet gateways per Region", 5.0, false),
+                    new QuotaDefinition("L-DF5E4CA3", "Network interfaces per Region", 5000.0, false)),
+            // https://docs.aws.amazon.com/general/latest/gr/ebs-service.html
+            "ebs", List.of(
+                    new QuotaDefinition("L-D18FCD1D", "Storage for General Purpose SSD (gp2) volumes, in TiB", 50.0,
+                            false),
+                    new QuotaDefinition("L-309BACF6", "Snapshots per Region", 100000.0, false),
+                    new QuotaDefinition("L-B3A130E6", "IOPS for Provisioned IOPS SSD (io1) volumes", 300000.0, false),
+                    new QuotaDefinition("L-FD252861", "Storage for Provisioned IOPS SSD (io1) volumes, in TiB", 50.0,
+                            false)),
+            // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-limits.html
+            // https://docs.aws.amazon.com/elasticloadbalancing/latest/classic/elb-limits.html
+            "elasticloadbalancing", List.of(
+                    new QuotaDefinition("L-53DA6B97", "Application Load Balancers per Region", 50.0, false),
+                    new QuotaDefinition("L-E9E9831D", "Classic Load Balancers per Region", 20.0, false)),
+            // https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html
+            "iam", List.of(
+                    new QuotaDefinition("L-0DA4ABF3", "Managed policies per role", 10.0, true)));
 
     private static final List<String> GENERIC_QUOTA_NAMES = List.of(
             "Resources per Region",
@@ -85,6 +126,7 @@ public class ServiceQuotasService {
 
     private final ObjectMapper objectMapper;
     private final int standardOnDemandVcpus;
+    private final Map<String, Double> appliedValues;
     private final StorageBackend<String, ObjectNode> requestedQuotaStore;
     private final Object openRequestLock = new Object();
 
@@ -93,6 +135,7 @@ public class ServiceQuotasService {
         this.objectMapper = objectMapper;
         this.standardOnDemandVcpus = config.services().servicequotas().standardOnDemandVcpus();
         ServiceQuotasStartupValidator.validateStandardOnDemandVcpus(standardOnDemandVcpus);
+        this.appliedValues = ServiceQuotasStartupValidator.parseAppliedValues(config.services().servicequotas().appliedValues());
         this.requestedQuotaStore = storageFactory.create("servicequotas",
                 "servicequotas-requested-changes.json",
                 new TypeReference<Map<String, ObjectNode>>() {});
@@ -212,14 +255,27 @@ public class ServiceQuotasService {
                 serviceCode + "/" + quota.quotaCode()).toString());
         node.put("QuotaCode", quota.quotaCode());
         node.put("QuotaName", quota.quotaName());
-        double value = applied && "ec2".equals(serviceCode) && "L-1216C47A".equals(quota.quotaCode())
-                ? standardOnDemandVcpus : quota.value();
+        double value = defaultValue(serviceCode, quota, region);
+        if (applied) {
+            if ("ec2".equals(serviceCode) && "L-1216C47A".equals(quota.quotaCode())) {
+                value = standardOnDemandVcpus;
+            }
+            value = appliedValues.getOrDefault(serviceCode + "/" + quota.quotaCode(), value);
+        }
         node.put("Value", value);
         node.put("Unit", "None");
         node.put("Adjustable", true);
         node.put("GlobalQuota", quota.globalQuota());
         node.put("QuotaAppliedAtLevel", quota.appliedAtLevel());
         return node;
+    }
+
+    private static double defaultValue(String serviceCode, QuotaDefinition quota, String region) {
+        if ("ebs".equals(serviceCode) && EBS_STORAGE_QUOTAS.contains(quota.quotaCode()) && region != null
+                && !EBS_50_TIB_REGIONS.contains(region)) {
+            return EBS_STORAGE_ELSEWHERE_TIB;
+        }
+        return quota.value();
     }
 
     /**

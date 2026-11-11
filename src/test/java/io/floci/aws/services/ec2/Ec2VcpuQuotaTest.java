@@ -63,6 +63,15 @@ class Ec2VcpuQuotaTest {
     }
 
     @Test
+    void anAppliedValueForTheVcpuQuotaIsTheAdmissionLimit() {
+        Ec2Service service = service(2, true, Optional.of(List.of("ec2/L-1216C47A=4")));
+        Instance running = instance("i-running", "running");
+        service.putInstanceForTest(running);
+        assertEquals(1, service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1, null,
+                List.of(), null, null, List.of(), null, null).getInstances().size());
+    }
+
+    @Test
     void pendingLaunchesDoNotReserveFutureRunningCapacity() {
         Ec2Service service = service(2, true);
         Instance first = launch(service, "t3.micro");
@@ -178,6 +187,10 @@ class Ec2VcpuQuotaTest {
     }
 
     private static Ec2Service service(int limit, boolean enabled) {
+        return service(limit, enabled, Optional.empty());
+    }
+
+    private static Ec2Service service(int limit, boolean enabled, Optional<List<String>> appliedValues) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services().ec2().mock()).thenReturn(true);
@@ -186,6 +199,7 @@ class Ec2VcpuQuotaTest {
                 .thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.NONE);
         when(config.services().ec2().mockPublicAddress()).thenReturn(Optional.empty());
         when(config.services().servicequotas().standardOnDemandVcpus()).thenReturn(limit);
+        when(config.services().servicequotas().appliedValues()).thenReturn(appliedValues);
         return new Ec2Service(config, mock(Ec2ContainerManager.class), mock(Ec2PortForwardManager.class),
                 mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
                 new MemoryFactory());

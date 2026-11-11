@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.ServiceQuotasStartupValidator;
 import io.floci.aws.core.common.AvailabilityZoneIds;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
@@ -5464,8 +5465,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private int appliedStandardOnDemandLimit() {
-        return config.services().servicequotas() == null ? 5
-                : config.services().servicequotas().standardOnDemandVcpus();
+        EmulatorConfig.ServiceQuotasServiceConfig quotas = config.services().servicequotas();
+        if (quotas == null) {
+            return 5;
+        }
+        Double applied = quotas.appliedValues() == null ? null
+                : ServiceQuotasStartupValidator.parseAppliedValues(quotas.appliedValues()).get("ec2/L-1216C47A");
+        return applied != null ? (int) Math.min(Integer.MAX_VALUE, Math.floor(applied)) : quotas.standardOnDemandVcpus();
     }
 
     private int admittedInstanceCount(String region, String instanceType, int minimum, int maximum) {

@@ -1199,6 +1199,12 @@ public interface EmulatorConfig {
 
         @WithDefault("5")
         int standardOnDemandVcpus();
+
+        /**
+         * Applied values that differ from AWS's defaults, as {@code <serviceCode>/<quotaCode>=<value>} entries, for
+         * example {@code ec2/L-1216C47A=100}. AWS defaults stay what GetAWSDefaultServiceQuota returns.
+         */
+        Optional<List<String>> appliedValues();
     }
 
     interface VerifiedPermissionsServiceConfig {

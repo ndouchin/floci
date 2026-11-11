@@ -1124,6 +1124,7 @@ floci:
     servicequotas:
       enabled: true
       standard-on-demand-vcpus: 5
+      # applied-values: ec2/L-1216C47A=100,vpc/L-F678F1CE=10  # applied values that differ from AWS's defaults
     verifiedpermissions:
       enabled: true
       # cedar-url: http://floci-cedar:8180  # set to skip sidecar container management

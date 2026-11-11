@@ -51,7 +51,7 @@ class ServiceQuotasTest {
     }
 
     private static void assertCatalogPages(List<List<ServiceQuota>> pages, ServiceQuota standardQuota) {
-        assertThat(pages).hasSize(4).allSatisfy(page -> assertThat(page).hasSize(1));
+        assertThat(pages).hasSize(5).allSatisfy(page -> assertThat(page).hasSize(1));
         List<ServiceQuota> quotas = pages.stream().flatMap(List::stream).toList();
         assertThat(quotas).extracting(ServiceQuota::quotaCode).doesNotHaveDuplicates();
         assertThat(quotas.stream().filter(item -> STANDARD_CODE.equals(item.quotaCode())).toList())

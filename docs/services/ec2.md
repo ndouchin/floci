@@ -82,7 +82,8 @@ quota (`L-1216C47A`) for the caller's account and region. The flag defaults to
 because its default vCPU count is absent from the snapshot.
 
 `FLOCI_SERVICES_SERVICEQUOTAS_STANDARD_ON_DEMAND_VCPUS` supplies the applied value
-(default `5`). Service Quotas reports this value independently of admission.
+(default `5`), unless `FLOCI_SERVICES_SERVICEQUOTAS_APPLIED_VALUES` has an
+`ec2/L-1216C47A` entry ([Service Quotas](servicequotas.md#quotas-the-rosa-cli-checks)). Service Quotas reports this value independently of admission.
 With admission enabled, a launch batch can return fewer than `MaxCount` when at
 least `MinCount` fits, otherwise it returns `VcpuLimitExceeded`. A refused start
 leaves stopped instances unchanged. Types in the Standard bucket require a

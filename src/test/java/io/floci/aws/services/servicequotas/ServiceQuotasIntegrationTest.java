@@ -218,7 +218,7 @@ class ServiceQuotasIntegrationTest {
             .then().log().ifValidationFails().statusCode(200)
                 .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.QuotaName", equalTo(name))
                 .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.Value", equalTo(5.0f))
-                .body("Quotas.size()", equalTo(4));
+                .body("Quotas.size()", equalTo(5));
         }
     }
 
@@ -566,7 +566,7 @@ class ServiceQuotasIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Quotas.size()", equalTo(4))
+            .body("Quotas.size()", equalTo(5))
             .body("Quotas.find { it.QuotaCode == 'L-1216C47A' }.QuotaAppliedAtLevel", equalTo("ACCOUNT"));
     }
 
@@ -582,7 +582,7 @@ class ServiceQuotasIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Quotas.size()", equalTo(4));
+            .body("Quotas.size()", equalTo(5));
     }
 
     @Test
@@ -598,7 +598,7 @@ class ServiceQuotasIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("Quotas.size()", equalTo(4));
+            .body("Quotas.size()", equalTo(5));
     }
 
     @Test
@@ -723,5 +723,26 @@ class ServiceQuotasIntegrationTest {
         List<String> sortedCodes = new ArrayList<>(codes);
         sortedCodes.sort(String::compareToIgnoreCase);
         assertEquals(sortedCodes, codes, "Services must be sorted by ServiceCode (case-insensitive)");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "ec2, L-0263D0A3, 5", "ec2, L-1216C47A, 5", "vpc, L-F678F1CE, 5", "vpc, L-A4707A72, 5",
+            "vpc, L-DF5E4CA3, 5000", "ebs, L-D18FCD1D, 50", "ebs, L-309BACF6, 100000", "ebs, L-B3A130E6, 300000",
+            "ebs, L-FD252861, 50", "elasticloadbalancing, L-53DA6B97, 50", "elasticloadbalancing, L-E9E9831D, 20",
+            "iam, L-0DA4ABF3, 10"
+    })
+    void everyQuotaRosaChecksIsListedWithItsAwsDefault(String serviceCode, String quotaCode, float value) {
+        given()
+            .contentType(CONTENT_TYPE)
+            .header("X-Amz-Target", "ServiceQuotasV20190624.ListServiceQuotas")
+            .header("Authorization", AUTH_HEADER)
+            .body("{\"ServiceCode\":\"" + serviceCode + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Quotas.find { it.QuotaCode == '" + quotaCode + "' }.Value", equalTo(value))
+            .body("Quotas.find { it.QuotaCode == '" + quotaCode + "' }.ServiceCode", equalTo(serviceCode));
     }
 }
