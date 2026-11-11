@@ -3900,6 +3900,27 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean vpcRouteProgramming();
+
+        /**
+         * The most nodes Floci runs as k3s agents per cluster, across its managed node groups in creation
+         * order. Nodes past it keep their record and count in the API, with no agent; 0 means no cap.
+         */
+        @WithDefault("5")
+        int maxNodesPerCluster();
+
+        /**
+         * How long a node group waits for its nodes to be Ready before it is CREATE_FAILED with a
+         * NodeCreationFailure issue. EKS gives a node 15 minutes to join.
+         */
+        @WithDefault("900")
+        int nodeReadyTimeoutSeconds();
+
+        /**
+         * How long a node group version update waits for a node to drain before it fails with a
+         * PodEvictionFailure issue, unless the update is forced. EKS waits 15 minutes.
+         */
+        @WithDefault("900")
+        int nodeDrainTimeoutSeconds();
     }
 
     /**

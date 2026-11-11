@@ -8,6 +8,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -107,7 +108,112 @@ public class Nodegroup {
     @JsonIgnore
     private String accountId;
 
+    /**
+     * The node group's nodes, one k3s agent each while under the node cap. Internal persisted state, left out
+     * of API responses by {@code EksController.toNodegroupResponse}.
+     */
+    @JsonProperty("nodes")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private List<EksNode> nodes;
+
+    /** How many nodes the node group has launched: the next node's launch index, so a replacement gets a new identity. */
+    @JsonProperty("launchCounter")
+    @JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    private int launchCounter;
+
+    /** The update the node reconciler finishes once the node group's nodes match it. */
+    @JsonProperty("pendingUpdateId")
+    private String pendingUpdateId;
+
+    /** The Kubernetes version a version update replaces the nodes with. */
+    @JsonProperty("pendingVersion")
+    private String pendingVersion;
+
+    @JsonProperty("pendingReleaseVersion")
+    private String pendingReleaseVersion;
+
+    @JsonProperty("pendingLaunchTemplate")
+    private Object pendingLaunchTemplate;
+
+    @JsonProperty("pendingForce")
+    @JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    private boolean pendingForce;
+
+    @JsonProperty("pendingSince")
+    @JsonFormat(shape = JsonFormat.Shape.NUMBER)
+    private Instant pendingSince;
+
     public Nodegroup() {}
+
+    /** A copy without the internal node state, for an API response. */
+    public Nodegroup withoutInternalState() {
+        Nodegroup copy = new Nodegroup();
+        copy.nodegroupName = nodegroupName;
+        copy.nodegroupArn = nodegroupArn;
+        copy.clusterName = clusterName;
+        copy.version = version;
+        copy.releaseVersion = releaseVersion;
+        copy.createdAt = createdAt;
+        copy.modifiedAt = modifiedAt;
+        copy.status = status;
+        copy.capacityType = capacityType;
+        copy.scalingConfig = scalingConfig;
+        copy.instanceTypes = instanceTypes;
+        copy.subnets = subnets;
+        copy.remoteAccess = remoteAccess;
+        copy.amiType = amiType;
+        copy.nodeRole = nodeRole;
+        copy.labels = labels;
+        copy.taints = taints;
+        copy.resources = resources;
+        copy.diskSize = diskSize;
+        copy.health = health;
+        copy.updateConfig = updateConfig;
+        copy.nodeRepairConfig = nodeRepairConfig;
+        copy.launchTemplate = launchTemplate;
+        copy.warmPoolConfig = warmPoolConfig;
+        copy.tags = tags;
+        copy.clientRequestToken = clientRequestToken;
+        copy.accountId = accountId;
+        return copy;
+    }
+
+    public boolean hasInternalState() {
+        return (nodes != null && !nodes.isEmpty()) || launchCounter != 0 || pendingUpdateId != null
+                || pendingVersion != null || pendingReleaseVersion != null || pendingLaunchTemplate != null
+                || pendingForce || pendingSince != null;
+    }
+
+    public List<EksNode> getNodes() {
+        if (nodes == null) {
+            nodes = new ArrayList<>();
+        } else if (!(nodes instanceof ArrayList)) {
+            nodes = new ArrayList<>(nodes);
+        }
+        return nodes;
+    }
+    public void setNodes(List<EksNode> nodes) { this.nodes = nodes == null ? null : new ArrayList<>(nodes); }
+
+    public int getLaunchCounter() { return launchCounter; }
+    public void setLaunchCounter(int launchCounter) { this.launchCounter = launchCounter; }
+
+    public String getPendingUpdateId() { return pendingUpdateId; }
+    public void setPendingUpdateId(String pendingUpdateId) { this.pendingUpdateId = pendingUpdateId; }
+
+    public String getPendingVersion() { return pendingVersion; }
+    public void setPendingVersion(String pendingVersion) { this.pendingVersion = pendingVersion; }
+
+    public String getPendingReleaseVersion() { return pendingReleaseVersion; }
+    public void setPendingReleaseVersion(String pendingReleaseVersion) { this.pendingReleaseVersion = pendingReleaseVersion; }
+
+    public Object getPendingLaunchTemplate() { return pendingLaunchTemplate; }
+    public void setPendingLaunchTemplate(Object pendingLaunchTemplate) { this.pendingLaunchTemplate = pendingLaunchTemplate; }
+
+    public boolean isPendingForce() { return pendingForce; }
+    public void setPendingForce(boolean pendingForce) { this.pendingForce = pendingForce; }
+
+    public Instant getPendingSince() { return pendingSince; }
+    public void setPendingSince(Instant pendingSince) { this.pendingSince = pendingSince; }
 
     public String getNodegroupName() { return nodegroupName; }
     public void setNodegroupName(String nodegroupName) { this.nodegroupName = nodegroupName; }
