@@ -444,6 +444,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
     }
 
+    /**
+     * Leases {@code address} of a Docker-backed subnet again for a holder that kept it across a restart, which empties
+     * the in-memory lease table while its container goes on holding the address; false when the subnet is not
+     * Docker-backed, the address is outside its range, or another holder has it.
+     */
+    public boolean claimVpcPrivateIp(String region, String subnetId, String address) {
+        if (vpcNetworkManager == null || address == null) {
+            return false;
+        }
+        synchronized (privateIpAllocationLock) {
+            boolean claimed = vpcNetworkManager.claimPrivateIp(region, subnetId, address);
+            if (claimed) {
+                containerPrivateIps.computeIfAbsent(key(region, subnetId), ignored -> new HashSet<>()).add(address);
+            }
+            return claimed;
+        }
+    }
+
     public void releaseVpcPrivateIp(String region, String subnetId, String address) {
         synchronized (privateIpAllocationLock) {
             containerPrivateIps.computeIfPresent(key(region, subnetId), (ignored, addresses) -> {

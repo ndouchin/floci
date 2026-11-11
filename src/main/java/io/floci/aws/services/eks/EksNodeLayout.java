@@ -154,6 +154,9 @@ final class EksNodeLayout {
 
     /** {@code <major>.<minor>.<patch>-<date>}, the patch being the k3s release Floci runs for that minor. */
     static String releaseVersion(String kubernetesVersion) {
+        if (kubernetesVersion == null) {
+            return null;
+        }
         String image = EksClusterManager.SUPPORTED_K8S_VERSIONS.get(kubernetesVersion);
         Matcher matcher = image == null ? null : IMAGE_MINOR.matcher(image);
         String patch = matcher != null && matcher.find()

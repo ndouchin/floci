@@ -4,9 +4,11 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.fasterxml.jackson.dataformat.yaml.YAMLGenerator;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -21,6 +23,9 @@ final class EksAwsAuthConfigMap {
     private static final Logger LOG = Logger.getLogger(EksAwsAuthConfigMap.class);
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory());
+    private static final ObjectMapper NODE_YAML = new ObjectMapper(new YAMLFactory()
+            .disable(YAMLGenerator.Feature.WRITE_DOC_START_MARKER)
+            .enable(YAMLGenerator.Feature.MINIMIZE_QUOTES));
 
     record Mapping(String username, List<String> groups) {}
 
@@ -38,6 +43,33 @@ final class EksAwsAuthConfigMap {
         } catch (Exception e) {
             LOG.warnv("Ignoring an aws-auth ConfigMap that does not parse: {0}", e.getMessage());
             return Optional.empty();
+        }
+    }
+
+    /**
+     * {@code mapRoles} with the node mapping EKS writes for a managed node group's role, or null when the role's
+     * canonical ARN is mapped already: the role, {@code system:node:{{EC2PrivateDNSName}}}, and the groups
+     * {@code system:bootstrappers} and {@code system:nodes}.
+     */
+    static String withNodeRole(String mapRolesYaml, String roleArn) {
+        String canonical = EksWorkerAuthentication.canonicalArn(roleArn);
+        try {
+            if (match(mapRolesYaml == null ? "" : mapRolesYaml, "rolearn", canonical).isPresent()) {
+                return null;
+            }
+            List<Map<String, Object>> entries = mapRolesYaml == null || mapRolesYaml.isBlank() ? new ArrayList<>()
+                    : YAML.readValue(mapRolesYaml, new TypeReference<List<Map<String, Object>>>() {});
+            List<Map<String, Object>> merged = new ArrayList<>(entries == null ? List.of() : entries);
+            Map<String, Object> node = new LinkedHashMap<>();
+            node.put("groups", List.of("system:bootstrappers", "system:nodes"));
+            node.put("rolearn", canonical);
+            node.put("username", "system:node:{{EC2PrivateDNSName}}");
+            merged.add(node);
+            return NODE_YAML.writeValueAsString(merged);
+        } catch (Exception e) {
+            LOG.warnv("Not adding node role {0} to an aws-auth ConfigMap that does not parse: {1}", roleArn,
+                    e.getMessage());
+            return null;
         }
     }
 

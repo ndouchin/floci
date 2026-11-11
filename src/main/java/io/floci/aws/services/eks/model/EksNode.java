@@ -19,6 +19,7 @@ public class EksNode {
     private String instanceId;
     private String nodeName;
     private String privateIp;
+    private String clusterIp;
     private String subnetId;
     private String availabilityZone;
     private String availabilityZoneId;
@@ -45,6 +46,7 @@ public class EksNode {
         copy.instanceId = instanceId;
         copy.nodeName = nodeName;
         copy.privateIp = privateIp;
+        copy.clusterIp = clusterIp;
         copy.subnetId = subnetId;
         copy.availabilityZone = availabilityZone;
         copy.availabilityZoneId = availabilityZoneId;
@@ -72,6 +74,10 @@ public class EksNode {
 
     public String getPrivateIp() { return privateIp; }
     public void setPrivateIp(String privateIp) { this.privateIp = privateIp; }
+
+    /** The node's fixed address on the cluster network; its private IP too when no VPC address was leased. */
+    public String getClusterIp() { return clusterIp; }
+    public void setClusterIp(String clusterIp) { this.clusterIp = clusterIp; }
 
     public String getSubnetId() { return subnetId; }
     public void setSubnetId(String subnetId) { this.subnetId = subnetId; }

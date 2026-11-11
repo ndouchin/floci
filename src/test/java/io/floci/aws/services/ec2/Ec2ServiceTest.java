@@ -5198,6 +5198,33 @@ class Ec2ServiceTest {
     }
 
     @Test
+    void anAddressAContainerHoldsAcrossARestartIsClaimedBackAndInUse() {
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(new RequestContext(), Map.of(), vpcNetworks);
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a");
+        service.describeSubnets("us-east-1", List.of(), Map.of());
+        when(vpcNetworks.claimPrivateIp("us-east-1", subnetId, "172.31.0.42")).thenReturn(true);
+
+        assertTrue(service.claimVpcPrivateIp("us-east-1", subnetId, "172.31.0.42"));
+
+        AwsException inUse = assertThrows(AwsException.class, () -> service.createNetworkInterface("us-east-1",
+                subnetId, "named", "172.31.0.42", List.of(), List.of(), List.of()));
+        assertEquals("InvalidIPAddress.InUse", inUse.getErrorCode());
+        service.releaseVpcPrivateIp("us-east-1", subnetId, "172.31.0.42");
+        verify(vpcNetworks).releasePrivateIp("us-east-1", subnetId, "172.31.0.42");
+    }
+
+    @Test
+    void anAddressAnotherHolderHasIsNotClaimed() {
+        VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
+        Ec2Service service = mockedVpcNetworkService(new RequestContext(), Map.of(), vpcNetworks);
+        String subnetId = Ec2Service.defaultSubnetId("us-east-1", "a");
+        when(vpcNetworks.claimPrivateIp("us-east-1", subnetId, "172.31.0.42")).thenReturn(false);
+
+        assertFalse(service.claimVpcPrivateIp("us-east-1", subnetId, "172.31.0.42"));
+    }
+
+    @Test
     void anInterfaceEndpointCreatedAfterContainerLeasesTakesAnAddressNoContainerHolds() {
         // Ten of a /28's eleven assignable addresses leased to containers, so whatever the endpoint
         // id prefers, its interface must land on the one left over.
