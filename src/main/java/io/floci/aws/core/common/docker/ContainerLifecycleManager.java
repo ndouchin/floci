@@ -1781,6 +1781,14 @@ public class ContainerLifecycleManager {
                 && !isContainerNetworkMode(spec.networkMode())) {
             hostConfig.withDns(spec.dnsServers().toArray(new String[0]));
         }
+        if (!isContainerNetworkMode(spec.networkMode())) {
+            if (!spec.linuxOptions().dnsSearch().isEmpty()) {
+                hostConfig.withDnsSearch(spec.linuxOptions().dnsSearch());
+            }
+            if (!spec.linuxOptions().dnsOptions().isEmpty()) {
+                hostConfig.withDnsOptions(spec.linuxOptions().dnsOptions());
+            }
+        }
 
         // Device requests (GPUs). Only set when a caller asked: a daemon configured with an
         // accelerator runtime as its default must not start handing devices to every

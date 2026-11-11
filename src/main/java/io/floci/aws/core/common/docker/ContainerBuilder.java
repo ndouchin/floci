@@ -199,6 +199,8 @@ public class ContainerBuilder {
         private Long shmSizeBytes;
         private final Map<String, String> tmpfs = new HashMap<>();
         private final Map<String, String> sysctls = new HashMap<>();
+        private final List<String> dnsSearch = new ArrayList<>();
+        private final List<String> dnsOptions = new ArrayList<>();
         private Long memorySwapBytes;
         private Long memorySwappiness;
         private boolean javaTrustStore;
@@ -712,6 +714,11 @@ public class ContainerBuilder {
          * Mounts a tmpfs at {@code containerPath} ({@code --tmpfs}), with Docker's option string,
          * such as {@code "noexec,size=64m"}.
          */
+        public Builder withTmpfs(String containerPath, String options) {
+            this.tmpfs.put(containerPath, options);
+            return this;
+        }
+
         /** Sets a namespaced kernel parameter in the container, as {@code docker run --sysctl} does. */
         public Builder withSysctl(String name, String value) {
             if (name != null && !name.isBlank() && value != null) {
@@ -720,8 +727,19 @@ public class ContainerBuilder {
             return this;
         }
 
-        public Builder withTmpfs(String containerPath, String options) {
-            this.tmpfs.put(containerPath, options);
+        /** Adds a search domain to the container's resolver, as {@code docker run --dns-search} does. */
+        public Builder withDnsSearch(String domain) {
+            if (domain != null && !domain.isBlank()) {
+                this.dnsSearch.add(domain.strip());
+            }
+            return this;
+        }
+
+        /** Adds an option to the container's resolver, as {@code docker run --dns-option} does. */
+        public Builder withDnsOption(String option) {
+            if (option != null && !option.isBlank()) {
+                this.dnsOptions.add(option.strip());
+            }
             return this;
         }
 
@@ -830,7 +848,8 @@ public class ContainerBuilder {
                     Map.copyOf(portBindingHostIps),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, Map.copyOf(sysctls)),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, Map.copyOf(sysctls),
+                            List.copyOf(dnsSearch), List.copyOf(dnsOptions)),
                     javaTrustStore
             );
         }

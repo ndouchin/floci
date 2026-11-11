@@ -15,6 +15,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -109,6 +110,18 @@ class ContainerLifecycleManagerLinuxOptionsTest {
     }
 
     @Test
+    void dnsSearchDomainsAndOptionsReachTheHostConfig() {
+        CreateContainerCmd createCmd = stubCreateContainer();
+
+        manager().create(builder().withDnsServer("10.0.0.2").withDnsSearch("ec2.internal").withDnsOption("ndots:1")
+                .build());
+
+        HostConfig hostConfig = capturedHostConfig(createCmd);
+        assertArrayEquals(new String[] {"ec2.internal"}, hostConfig.getDnsSearch());
+        assertEquals(List.of("ndots:1"), hostConfig.getDnsOptions());
+    }
+
+    @Test
     void aContainerThatAskedForNoneGetsTheDaemonDefaults() {
         CreateContainerCmd createCmd = stubCreateContainer();
 
@@ -124,6 +137,8 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getMemorySwap());
         assertNull(hostConfig.getMemorySwappiness());
         assertNull(hostConfig.getSysctls());
+        assertNull(hostConfig.getDnsSearch());
+        assertNull(hostConfig.getDnsOptions());
     }
 
     @Test
