@@ -44,6 +44,8 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateClusterVersionRequest;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
@@ -78,6 +80,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -1186,6 +1189,54 @@ class EksServiceTest {
         cluster.setContainerId("existing-container");
         cluster.setStatus(ClusterStatus.ACTIVE);
         return cluster;
+    }
+
+    @Test
+    void clusterVersionUpdateRecreatesTheNodeOnTheNewVersion() throws Exception {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.tryStartCluster(any())).thenReturn(true);
+        when(clusterManager.restartForVersion(any())).thenReturn(true);
+        when(clusterManager.isReady(any())).thenReturn(true);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "upgraded");
+
+        Update update = service.updateClusterVersion("upgraded", new UpdateClusterVersionRequest("1.30", null, null));
+
+        assertEquals("InProgress", update.status());
+        verify(clusterManager, timeout(5000)).finalizeCluster(cluster);
+        awaitStatus(cluster, ClusterStatus.ACTIVE);
+        assertEquals("1.30", cluster.getVersion());
+        assertTrue(cluster.isExplicitVersion());
+        verify(clusterManager).restartForVersion(cluster);
+    }
+
+    @Test
+    void aClusterDeletedDuringItsVersionUpdateIsNotWrittenBack() throws Exception {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.tryStartCluster(any())).thenReturn(true);
+        when(clusterManager.restartForVersion(any())).thenReturn(true);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "doomed");
+        // The delete lands while the update waits for the new API server.
+        when(clusterManager.isReady(any())).thenAnswer(invocation -> {
+            service.deleteCluster("doomed");
+            return true;
+        });
+
+        service.updateClusterVersion("doomed", new UpdateClusterVersionRequest("1.30", null, null));
+
+        verify(clusterManager, timeout(5000)).finalizeCluster(cluster);
+        Thread.sleep(200);
+        assertTrue(createdStorage("eks-clusters.json").get("doomed").isEmpty());
+        assertThrows(AwsException.class, () -> service.describeCluster("doomed"));
+    }
+
+    private static void awaitStatus(Cluster cluster, ClusterStatus status) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (cluster.getStatus() != status && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertEquals(status, cluster.getStatus());
     }
 
     private static EksClusterManager capacitySwapManager(boolean swapSucceeds) {

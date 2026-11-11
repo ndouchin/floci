@@ -1428,8 +1428,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         String failure = null;
         boolean replaced = false;
         synchronized (capacityLock(accountId, cluster.getName())) {
-            if (isClusterDeleting(accountId, cluster) || findAuthenticationCluster(accountId, cluster.getName())
-                    .filter(current -> current == cluster).isEmpty()) {
+            if (!stillStored(accountId, cluster)) {
                 return;
             }
             cluster.setVersion(version);
@@ -1450,6 +1449,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                     cluster.setExplicitVersion(previousExplicit);
                 }
             }
+            if (!stillStored(accountId, cluster)) {
+                return;
+            }
             putCluster(cluster);
         }
         if (replaced && failure == null) {
@@ -1463,12 +1465,21 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                     cluster.getName(), version, failure);
         }
         synchronized (capacityLock(accountId, cluster.getName())) {
+            if (!stillStored(accountId, cluster)) {
+                return;
+            }
             if (cluster.getStatus() == ClusterStatus.UPDATING) {
                 cluster.setStatus(ClusterStatus.ACTIVE);
             }
             putCluster(cluster);
         }
         finishUpdate(cluster, updateId, failure);
+    }
+
+    /** False once the cluster was deleted, or replaced by one recreated under its name, so it is not written back. */
+    private boolean stillStored(String accountId, Cluster cluster) {
+        return !isClusterDeleting(accountId, cluster) && findAuthenticationCluster(accountId, cluster.getName())
+                .filter(current -> current == cluster).isPresent();
     }
 
     /** Null once the replaced API server answers and its certificate authority is read; else why not. */
