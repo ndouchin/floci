@@ -257,6 +257,12 @@ public class EksClusterManager
 
     private final Map<String, AgentNodeRecord> agentNodeInstances = new ConcurrentHashMap<>();
     private volatile EksNodeAgents nodeAgents;
+    private volatile EksLoadBalancerRuntime loadBalancerRuntime;
+
+    /** A load balancer's DNS name and the appliance address Floci's DNS answers it with. */
+    record LoadBalancerName(String clusterKey, String address) {}
+
+    private final Map<String, LoadBalancerName> loadBalancerNames = new ConcurrentHashMap<>();
 
     /** Which cluster owns a Docker address its node container answers on, and where that cluster sits. */
     record ClusterNodeVpc(String clusterResourceName, ClientVpc clientVpc) {}
@@ -303,6 +309,10 @@ public class EksClusterManager
                     && name.equals(inst.getPrivateDnsName().toLowerCase(Locale.ROOT))) {
                 return Optional.of(DnsAnswer.records(List.of(inst.getPrivateIpAddress()), DnsAnswer.DEFAULT_TTL_SECONDS));
             }
+        }
+        LoadBalancerName loadBalancer = loadBalancerNames.get(name);
+        if (loadBalancer != null && loadBalancer.address() != null) {
+            return Optional.of(DnsAnswer.records(List.of(loadBalancer.address()), DnsAnswer.DEFAULT_TTL_SECONDS));
         }
         for (Map<String, Instance> map : joinedClusterInstances.values()) {
             for (Instance inst : map.values()) {
@@ -1142,6 +1152,43 @@ public class EksClusterManager
         return ec2Service();
     }
 
+    /** The runtime the load balancer controller drives: kubectl in the server and one appliance per Service. */
+    EksLoadBalancerRuntime loadBalancerRuntime() {
+        EksLoadBalancerRuntime runtime = loadBalancerRuntime;
+        if (runtime == null) {
+            synchronized (this) {
+                if (loadBalancerRuntime == null) {
+                    loadBalancerRuntime = new EksLoadBalancerRuntime(this, lifecycleManager, containerBuilder,
+                            containerDetector, config);
+                }
+                runtime = loadBalancerRuntime;
+            }
+        }
+        return runtime;
+    }
+
+    /** The names of the cluster's load balancers, as Floci's DNS answers them. */
+    EksLoadBalancerController.Names loadBalancerNames() {
+        return new EksLoadBalancerController.Names() {
+            @Override
+            public void put(Cluster cluster, String hostname, String address) {
+                loadBalancerNames.put(hostname.toLowerCase(Locale.ROOT),
+                        new LoadBalancerName(clusterResourceName(cluster), address));
+            }
+
+            @Override
+            public void remove(Cluster cluster, String hostname) {
+                loadBalancerNames.remove(hostname.toLowerCase(Locale.ROOT));
+            }
+        };
+    }
+
+    /** The appliance container of a Service's load balancer; the {@code lb.} marker keeps it off cluster names. */
+    String loadBalancerContainerName(Cluster cluster, String serviceUid) {
+        return ContainerStorageHelper.resourceName(config, "eks", null,
+                "lb." + accountQualifiedClusterName(cluster) + "." + serviceUid);
+    }
+
     /** The k3s image of a node on {@code version}: the server's own when the node runs the cluster's version. */
     String nodeImage(Cluster cluster, String version) {
         if (version == null || version.equals(cluster.getVersion())) {
@@ -1637,6 +1684,9 @@ public class EksClusterManager
     public void stopCluster(Cluster cluster) {
         String resourceName = clusterResourceName(cluster);
         if (cluster.isAgentless()) {
+            loadBalancerRuntime().removeAll(cluster);
+            loadBalancerRuntime().forget(cluster);
+            loadBalancerNames.values().removeIf(name -> resourceName.equals(name.clusterKey()));
             nodeAgents().removeAllAgents(cluster);
             unregisterAgentNodes(resourceName);
         }

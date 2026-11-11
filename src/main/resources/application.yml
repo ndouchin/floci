@@ -878,6 +878,10 @@ floci:
       max-nodes-per-cluster: 5     # k3s agents run per cluster across its node groups; nodes past it have no agent (0 = no cap)
       node-ready-timeout-seconds: 900 # a node group not Ready by then is CREATE_FAILED (NodeCreationFailure), as on EKS
       node-drain-timeout-seconds: 900 # a node not drained by then fails a version update (PodEvictionFailure) unless forced
+      load-balancer:
+        mode: emulated             # emulated (EKS-shaped hostnames, an appliance per Service) | servicelb | off; recorded per new cluster
+        provisioning-delay-seconds: 0 # how long a new load balancer takes to get its hostname
+        host-ports: dynamic        # dynamic | same-as-service | none: the 127.0.0.1 port the Docker host reaches each Service port at
     mwaa:
       enabled: true
       mock: false

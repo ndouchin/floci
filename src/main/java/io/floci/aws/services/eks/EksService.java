@@ -155,7 +155,15 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final Set<String> restoringClusters = ConcurrentHashMap.newKeySet();
     private final Ec2InstanceTypeCatalog instanceTypeCatalog = new Ec2InstanceTypeCatalog();
     private volatile EksNodeReconciler nodeReconciler;
+    private volatile EksLoadBalancerController loadBalancerController;
     private int nodeSweeps;
+    private final Set<String> loadBalancerPasses = ConcurrentHashMap.newKeySet();
+    private final Set<String> loadBalancersClosed = ConcurrentHashMap.newKeySet();
+    private final ExecutorService loadBalancerRunner = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "floci-eks-load-balancers");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     @Inject
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -237,6 +245,9 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         new EksNodeReconciler.Settings(config.services().eks().maxNodesPerCluster(),
                                 config.services().eks().nodeReadyTimeoutSeconds(),
                                 config.services().eks().nodeDrainTimeoutSeconds()), Clock.systemUTC());
+                loadBalancerController = new EksLoadBalancerController(clusterManager.loadBalancerRuntime(),
+                        clusterManager.loadBalancerRuntime(), clusterManager.loadBalancerNames(), Clock.systemUTC(),
+                        () -> config.services().eks().loadBalancer().provisioningDelaySeconds());
             }
             restorePersistedClusters();
         } else {
@@ -690,6 +701,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         if (nodeReconciler != null) {
             nodeReconciler.shutdown();
         }
+        loadBalancerRunner.shutdownNow();
         updateRunner.shutdownNow();
         addonRunner.shutdownNow();
         if (!config.services().eks().mock()) {
@@ -815,6 +827,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setCertificateAuthority(new CertificateAuthority(""));
         cluster.setMetricsServer(false);
         cluster.setTopology(Cluster.AGENTLESS_TOPOLOGY);
+        cluster.setLoadBalancerMode(configuredLoadBalancerMode());
 
         try {
             String issuer = oidcService.newIssuerUrl(region);
@@ -1054,6 +1067,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         try {
             ClusterStatus previousStatus = cluster.getStatus();
             cluster.setStatus(ClusterStatus.DELETING);
+            String loadBalancerKey = cluster.getAccountId() + "/" + name;
+            closeLoadBalancers(loadBalancerKey);
             if (!config.services().eks().mock()) {
                 try {
                     clusterManager.stopCluster(cluster);
@@ -1079,8 +1094,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             if (nodeReconciler != null) {
                 nodeReconciler.forget(cluster.getAccountId(), name);
             }
+            if (loadBalancerController != null) {
+                loadBalancerController.forget(cluster);
+            }
             return cluster;
         } finally {
+            loadBalancersClosed.remove(cluster.getAccountId() + "/" + name);
             clustersBeingDeleted.remove(cluster);
         }
     }
@@ -2645,12 +2664,82 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
     }
 
+    /** The load balancer mode new clusters record: {@code floci.services.eks.load-balancer.mode}. */
+    private String configuredLoadBalancerMode() {
+        EmulatorConfig.EksLoadBalancerConfig loadBalancer = config.services().eks().loadBalancer();
+        return loadBalancer != null && loadBalancer.mode() != null ? loadBalancer.mode()
+                : EksClusterManager.LOAD_BALANCER_EMULATED;
+    }
+
+    /**
+     * Every 3 seconds, a load balancer pass over each running multi-node cluster in the {@code emulated} mode, one
+     * cluster at a time on a thread of its own; a cluster whose last pass still runs is skipped.
+     */
+    void reconcileLoadBalancers() {
+        if (loadBalancerController == null) {
+            return;
+        }
+        for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+            Cluster cluster = entry.value();
+            if (cluster.getStatus() != ClusterStatus.ACTIVE || !runsNodes(cluster)
+                    || !EksClusterManager.LOAD_BALANCER_EMULATED.equals(cluster.getLoadBalancerMode())) {
+                continue;
+            }
+            String key = entry.accountId() + "/" + cluster.getName();
+            if (loadBalancersClosed.contains(key) || isClusterDeleting(entry.accountId(), cluster)
+                    || !loadBalancerPasses.add(key)) {
+                continue;
+            }
+            Map<String, String> backends = new LinkedHashMap<>();
+            for (Nodegroup group : listNodeGroupsForCluster(cluster.getName(), entry.accountId())) {
+                for (EksNode node : group.getNodes()) {
+                    if (node.isRunning() && node.getNodeName() != null && node.getClusterIp() != null) {
+                        backends.put(node.getNodeName(), node.getClusterIp());
+                    }
+                }
+            }
+            String region = resolveClusterRegion(cluster);
+            try {
+                loadBalancerRunner.execute(() -> {
+                    try {
+                        RequestScopes.runAs(entry.accountId(), region,
+                                () -> loadBalancerController.reconcile(cluster, region, backends));
+                    } catch (RuntimeException e) {
+                        LOG.warnv(e, "Load balancer pass failed for EKS cluster {0}", cluster.getName());
+                    } finally {
+                        loadBalancerPasses.remove(key);
+                    }
+                });
+            } catch (RuntimeException e) {
+                loadBalancerPasses.remove(key);
+            }
+        }
+    }
+
+    /**
+     * Keeps load balancer passes off a cluster being deleted, and waits for the one running, so no appliance starts
+     * after the cluster's appliances are removed.
+     */
+    private void closeLoadBalancers(String key) {
+        loadBalancersClosed.add(key);
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (loadBalancerPasses.contains(key) && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
     /**
      * Retries the clusters whose nodes are not settled, every 3 seconds, and every 30 seconds asks for a pass over
      * every running multi-node cluster, which recreates dead agents and removes orphans.
      */
     void sweepNodes() {
         try {
+            reconcileLoadBalancers();
             nodeReconciler.retryUnsettled();
             if (++nodeSweeps % 10 == 0) {
                 for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {

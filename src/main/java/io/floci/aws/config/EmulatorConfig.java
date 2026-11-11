@@ -3921,6 +3921,30 @@ public interface EmulatorConfig {
          */
         @WithDefault("900")
         int nodeDrainTimeoutSeconds();
+
+        /** How Services of type LoadBalancer get their address on the clusters created from now on. */
+        EksLoadBalancerConfig loadBalancer();
+    }
+
+    interface EksLoadBalancerConfig {
+        /**
+         * {@code emulated} (k3s's servicelb off; Floci writes EKS-shaped hostnames to the Service status and runs an
+         * appliance container per Service), {@code servicelb} (k3s's servicelb writes node addresses, as before), or
+         * {@code off} (Services stay pending). Recorded on each cluster when it is created.
+         */
+        @WithDefault("emulated")
+        String mode();
+
+        /** How long a new load balancer takes to get its hostname. */
+        @WithDefault("0")
+        int provisioningDelaySeconds();
+
+        /**
+         * Which {@code 127.0.0.1} port the Docker host reaches each Service port at: {@code dynamic} (any free port),
+         * {@code same-as-service} (the Service's port when free), or {@code none}.
+         */
+        @WithDefault("dynamic")
+        String hostPorts();
     }
 
     /**
