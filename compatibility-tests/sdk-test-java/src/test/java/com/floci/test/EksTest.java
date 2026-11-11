@@ -31,6 +31,12 @@ class EksTest {
     static void cleanup() {
         if (eks != null) {
             if (clusterName != null) {
+                try {
+                    eks.deleteNodegroup(DeleteNodegroupRequest.builder()
+                            .clusterName(clusterName)
+                            .nodegroupName(NODEGROUP)
+                            .build());
+                } catch (Exception ignored) {}
                 if (nodegroupName != null) {
                     try {
                         eks.deleteNodegroup(DeleteNodegroupRequest.builder()
@@ -225,6 +231,14 @@ class EksTest {
         assertThat(described.update().status()).isIn(UpdateStatus.IN_PROGRESS, UpdateStatus.SUCCESSFUL);
         assertThat(eks.listUpdates(ListUpdatesRequest.builder().name(clusterName).nodegroupName(NODEGROUP).build())
                 .updateIds()).contains(response.update().id());
+    }
+
+    @Test
+    @Order(13)
+    void deleteClusterWithANodegroupFails() {
+        assertThatThrownBy(() -> eks.deleteCluster(DeleteClusterRequest.builder().name(clusterName).build()))
+                .isInstanceOf(ResourceInUseException.class)
+                .hasMessageContaining("Cluster has nodegroups attached");
     }
 
     @Test

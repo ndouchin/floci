@@ -1058,6 +1058,7 @@ class EksServiceTest {
         Cluster cluster = activeClusterWithRunningNode(service, "deleted-node");
         service.createNodeGroup("deleted-node", nodeGroupRequest("first"));
         when(clusterManager.isReady(cluster)).thenAnswer(invocation -> {
+            service.deleteNodeGroup("deleted-node", "first");
             service.deleteCluster("deleted-node");
             return true;
         });
@@ -1080,7 +1081,15 @@ class EksServiceTest {
         }).when(clusterManager).stopCluster(any());
         AtomicReference<Throwable> deleteError = new AtomicReference<>();
         AtomicReference<Thread.State> deleterDuringSwap = new AtomicReference<>();
-        Thread deleter = deleteThread(service, "deleted-during-swap", deleteError);
+        // EKS deletes no cluster with node groups, so the delete removes the node group first.
+        Thread deleter = Thread.ofPlatform().unstarted(() -> {
+            try {
+                service.deleteNodeGroup("deleted-during-swap", "first");
+                service.deleteCluster("deleted-during-swap");
+            } catch (Throwable e) {
+                deleteError.set(e);
+            }
+        });
         when(clusterManager.restartForNodeCapacity(any(), anyString())).thenAnswer(invocation -> {
             // As replaceClusterContainer does: no container while the replacement starts.
             Cluster swapping = invocation.getArgument(0);
@@ -1097,7 +1106,8 @@ class EksServiceTest {
         assertEquals(Thread.State.BLOCKED, deleterDuringSwap.get());
         assertFalse(deleter.isAlive());
         assertNull(deleteError.get());
-        assertEquals(NodegroupStatus.ACTIVE, group.getStatus());
+        // Created once the swap finished, then deleted by the delete that waited for it.
+        assertEquals(NodegroupStatus.DELETING, group.getStatus());
         assertTrue(createdStorage("eks-clusters.json").get("deleted-during-swap").isEmpty());
         assertEquals(List.of("replacement-container"), stoppedContainers);
     }
@@ -1506,6 +1516,9 @@ class EksServiceTest {
         assertEquals(NodegroupStatus.ACTIVE,
                 service.createNodeGroup("probe-eks", nodeGroupRequest("ng-1")).getStatus());
 
+        AwsException inUse = assertThrows(AwsException.class, () -> service.deleteCluster("probe-eks"));
+        assertEquals("ResourceInUseException", inUse.getErrorCode());
+        service.deleteNodeGroup("probe-eks", "ng-1");
         service.deleteCluster("probe-eks");
         assertThrows(AwsException.class, () -> service.describeCluster("probe-eks"));
     }

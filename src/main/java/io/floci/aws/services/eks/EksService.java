@@ -992,7 +992,23 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             if (cluster.getAccountId() == null) {
                 cluster.setAccountId(regionResolver.getAccountId());
             }
+            requireNoAttachedCompute(name);
             return deleteClusterHoldingCapacity(name, cluster);
+        }
+    }
+
+    /**
+     * EKS refuses to delete a cluster that still has managed node groups or Fargate profiles: "If you have
+     * managed node groups or Fargate profiles attached to the cluster, you must delete them first."
+     */
+    private void requireNoAttachedCompute(String name) {
+        if (!clusterNodegroups(name).isEmpty()) {
+            throw new AwsException("ResourceInUseException", "Cluster has nodegroups attached", 409);
+        }
+        String prefix = name + "/";
+        if (!fargateProfileStorage.scan(key -> key.startsWith(prefix)).isEmpty()) {
+            throw new AwsException("ResourceInUseException", "Cluster has Fargate Profiles in ACTIVE/CREATING state",
+                    409);
         }
     }
 

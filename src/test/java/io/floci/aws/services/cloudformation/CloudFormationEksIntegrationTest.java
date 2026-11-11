@@ -94,5 +94,14 @@ class CloudFormationEksIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString(nodegroupName));
+
+        // EKS refuses to delete a cluster with node groups, so the stack deletes the nodegroup, which
+        // depends on the cluster through its Ref, before the cluster.
+        CfnStackWaits.deleteStack(stackName, CFN_AUTH);
+        given()
+        .when()
+            .get("/clusters/" + clusterName)
+        .then()
+            .statusCode(404);
     }
 }
