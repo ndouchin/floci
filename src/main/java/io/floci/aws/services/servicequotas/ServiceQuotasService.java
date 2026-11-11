@@ -69,9 +69,12 @@ public class ServiceQuotasService {
      * The regions whose EBS gp2 and io1 storage quotas default to 50 TiB; every other region's default is 300 TiB.
      * https://docs.aws.amazon.com/general/latest/gr/ebs-service.html
      */
-    private static final Set<String> EBS_50_TIB_REGIONS = Set.of("us-east-1", "us-east-2", "us-west-1", "us-west-2",
-            "ap-northeast-1", "ap-northeast-2", "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ca-central-1",
-            "eu-central-1", "eu-north-1", "eu-west-1", "eu-west-2", "eu-west-3", "sa-east-1");
+    private static final Set<String> EBS_50_TIB_REGIONS = Set.of(
+            "us-east-1", "us-east-2", "us-west-1", "us-west-2", // partition-literal: AWS's quota table, not a default
+            "ap-northeast-1", "ap-northeast-2", "ap-south-1", // partition-literal: AWS's quota table, not a default
+            "ap-southeast-1", "ap-southeast-2", "ca-central-1", // partition-literal: AWS's quota table, not a default
+            "eu-central-1", "eu-north-1", "eu-west-1", // partition-literal: AWS's quota table, not a default
+            "eu-west-2", "eu-west-3", "sa-east-1"); // partition-literal: AWS's quota table, not a default
     private static final double EBS_STORAGE_ELSEWHERE_TIB = 300.0;
     private static final Set<String> EBS_STORAGE_QUOTAS = Set.of("L-D18FCD1D", "L-FD252861");
 
