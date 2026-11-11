@@ -98,6 +98,17 @@ class ContainerLifecycleManagerLinuxOptionsTest {
     }
 
     @Test
+    void sysctlsReachTheHostConfig() {
+        CreateContainerCmd createCmd = stubCreateContainer();
+
+        manager().create(builder().withCapAdd("NET_ADMIN").withSysctl("net.ipv4.ip_forward", "1").build());
+
+        HostConfig hostConfig = capturedHostConfig(createCmd);
+        assertEquals(Map.of("net.ipv4.ip_forward", "1"), hostConfig.getSysctls());
+        assertArrayEquals(new Capability[] {Capability.NET_ADMIN}, hostConfig.getCapAdd());
+    }
+
+    @Test
     void aContainerThatAskedForNoneGetsTheDaemonDefaults() {
         CreateContainerCmd createCmd = stubCreateContainer();
 
@@ -112,6 +123,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getTmpFs());
         assertNull(hostConfig.getMemorySwap());
         assertNull(hostConfig.getMemorySwappiness());
+        assertNull(hostConfig.getSysctls());
     }
 
     @Test

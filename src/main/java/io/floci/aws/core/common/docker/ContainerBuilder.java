@@ -198,6 +198,7 @@ public class ContainerBuilder {
         private final List<Device> devices = new ArrayList<>();
         private Long shmSizeBytes;
         private final Map<String, String> tmpfs = new HashMap<>();
+        private final Map<String, String> sysctls = new HashMap<>();
         private Long memorySwapBytes;
         private Long memorySwappiness;
         private boolean javaTrustStore;
@@ -711,6 +712,14 @@ public class ContainerBuilder {
          * Mounts a tmpfs at {@code containerPath} ({@code --tmpfs}), with Docker's option string,
          * such as {@code "noexec,size=64m"}.
          */
+        /** Sets a namespaced kernel parameter in the container, as {@code docker run --sysctl} does. */
+        public Builder withSysctl(String name, String value) {
+            if (name != null && !name.isBlank() && value != null) {
+                this.sysctls.put(name.strip(), value);
+            }
+            return this;
+        }
+
         public Builder withTmpfs(String containerPath, String options) {
             this.tmpfs.put(containerPath, options);
             return this;
@@ -821,7 +830,7 @@ public class ContainerBuilder {
                     Map.copyOf(portBindingHostIps),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, Map.copyOf(sysctls)),
                     javaTrustStore
             );
         }
