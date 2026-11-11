@@ -158,7 +158,8 @@ final class EksLoadBalancerRuntime implements EksLoadBalancerController.Kube, Ek
      * ({@code import /etc/coredns/custom/*.server}) when it loads its configuration, and the hosts file it answers
      * from, which the {@code hosts} plugin rereads every 5 seconds once the kubelet has synced the ConfigMap. The block
      * goes in on the cluster's first pass, before CoreDNS has a node to start on; CoreDNS pods already running when
-     * Floci creates the ConfigMap are restarted once, since CoreDNS does not reload for a newly imported file.
+     * Floci creates the ConfigMap are restarted once, rather than left to notice a file that appeared after they
+     * started.
      */
     @Override
     public void publishNames(Cluster cluster, String region, Map<String, String> addressesByHostname) {
