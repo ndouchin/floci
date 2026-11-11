@@ -21,6 +21,7 @@ import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.api.model.WaitContainerCondition;
@@ -1026,12 +1027,100 @@ public class ContainerLifecycleManager {
         LOG.debugv("Created network {0}", networkName);
     }
 
+    /**
+     * Creates the bridge network {@code networkName} on {@code subnet}, handing out dynamic addresses only from
+     * {@code ipRange} so the rest of the subnet stays free for containers connected at a fixed address, when Docker
+     * has no network of that name. Returns the subnet the network has: {@code subnet} for a new one, the existing
+     * network's own otherwise (null when it has none). Docker refuses a subnet another network overlaps, which the
+     * caller sees as the exception and answers with another subnet.
+     */
+    public String ensureNetwork(String networkName, String subnet, String ipRange, Map<String, String> labels) {
+        Optional<String> existing = existingNetworkSubnet(networkName);
+        if (existing != null) {
+            return existing.orElse(null);
+        }
+        Network.Ipam.Config pool = new Network.Ipam.Config().withSubnet(subnet);
+        if (ipRange != null && !ipRange.isBlank()) {
+            pool.withIpRange(ipRange);
+        }
+        dockerClient.createNetworkCmd()
+                .withName(networkName)
+                .withDriver("bridge")
+                .withIpam(new Network.Ipam().withConfig(pool))
+                .withLabels(mergedLabels(labels))
+                .exec();
+        LOG.debugv("Created network {0} on {1}", networkName, subnet);
+        return subnet;
+    }
+
+    /** The subnet of the network {@code networkName}, empty when Docker has no such network or it has no subnet. */
+    public Optional<String> networkSubnet(String networkName) {
+        Optional<String> existing = existingNetworkSubnet(networkName);
+        return existing == null ? Optional.empty() : existing;
+    }
+
+    // Null when the network does not exist; empty when it exists without a subnet.
+    private Optional<String> existingNetworkSubnet(String networkName) {
+        Network network;
+        try {
+            network = dockerClient.inspectNetworkCmd().withNetworkId(networkName).exec();
+        } catch (NotFoundException e) {
+            return null;
+        }
+        if (network == null || network.getIpam() == null || network.getIpam().getConfig() == null) {
+            return Optional.empty();
+        }
+        return network.getIpam().getConfig().stream()
+                .map(Network.Ipam.Config::getSubnet)
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst();
+    }
+
     /** Connects the created container {@code containerId} to {@code networkName} too, before it starts. */
     public void connectToNetwork(String containerId, String networkName) {
         dockerClient.connectToNetworkCmd()
                 .withContainerId(containerId)
                 .withNetworkId(networkName)
                 .exec();
+    }
+
+    /**
+     * Connects the container {@code containerId} to {@code networkName} at {@code ipv4Address}, which must lie in the
+     * network's subnet and outside its dynamic range for no other container to take it.
+     */
+    public void connectToNetwork(String containerId, String networkName, String ipv4Address) {
+        dockerClient.connectToNetworkCmd()
+                .withContainerId(containerId)
+                .withNetworkId(networkName)
+                .withContainerNetwork(new ContainerNetwork()
+                        .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(ipv4Address)))
+                .exec();
+    }
+
+    /**
+     * Moves the created container {@code containerId}'s endpoint on {@code networkName}, the network it was created
+     * on, to {@code ipv4Address}, before it starts.
+     */
+    public void reconnectToNetwork(String containerId, String networkName, String ipv4Address) {
+        dockerClient.disconnectFromNetworkCmd()
+                .withContainerId(containerId)
+                .withNetworkId(networkName)
+                .exec();
+        connectToNetwork(containerId, networkName, ipv4Address);
+    }
+
+    /** Every container, running or not, carrying all of {@code labels}; empty when Docker cannot be asked. */
+    public List<Container> listByLabels(Map<String, String> labels) {
+        try {
+            List<Container> containers = dockerClient.listContainersCmd()
+                    .withShowAll(true)
+                    .withLabelFilter(labels)
+                    .exec();
+            return containers == null ? List.of() : containers;
+        } catch (Exception e) {
+            LOG.debugv("Could not list containers labelled {0}: {1}", labels, e.getMessage());
+            return List.of();
+        }
     }
 
     /**
