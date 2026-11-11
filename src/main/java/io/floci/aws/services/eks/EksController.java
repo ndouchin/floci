@@ -113,7 +113,8 @@ public class EksController {
     private Cluster toClusterResponse(Cluster cluster) {
         if (cluster == null || (!cluster.isExplicitVersion() && cluster.getNodeInstanceType() == null
                 && cluster.getClusterArgs() == null && cluster.getDefaultStorageClass() == null
-                && cluster.getJoinedInstanceIds() == null && cluster.getCreatorArn() == null)) {
+                && cluster.getJoinedInstanceIds() == null && cluster.getCreatorArn() == null
+                && cluster.getMetricsServer() == null)) {
             return cluster;
         }
         Cluster response = cluster.copy();
@@ -123,6 +124,7 @@ public class EksController {
         response.setDefaultStorageClass(null);
         response.setJoinedInstanceIds(null);
         response.setCreatorArn(null);
+        response.setMetricsServer(null);
         return response;
     }
 
@@ -265,6 +267,7 @@ public class EksController {
     public Response createAddon(@PathParam("name") String name, CreateAddonRequest request) {
         Cluster cluster = eksService.describeCluster(name);
         Addon addon = addons.create(cluster, request);
+        eksService.addonInstalled(name, addon.addonName());
         return Response.ok(Map.of("addon", addon)).build();
     }
 
@@ -353,6 +356,7 @@ public class EksController {
                                 @QueryParam("preserve") Boolean preserve) {
         Cluster cluster = eksService.describeCluster(name);
         Addon addon = addons.delete(cluster, addonName, Boolean.TRUE.equals(preserve));
+        eksService.addonRemoved(name, addon.addonName(), Boolean.TRUE.equals(preserve));
         return Response.ok(Map.of("addon", addon)).build();
     }
 

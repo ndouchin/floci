@@ -111,6 +111,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     static final String CLUSTER_NAME_REGEX = "[0-9A-Za-z][A-Za-z0-9\\-_]*";
 
     private static final ObjectMapper UPDATE_PARAMS = new ObjectMapper();
+    private static final String METRICS_SERVER_ADDON = "metrics-server";
     private static final long CLUSTER_UPDATE_READY_TIMEOUT_MILLIS = 300_000;
 
     private static final String CLUSTER_SG_DESCRIPTION =
@@ -132,6 +133,12 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService updateRunner = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "floci-eks-update");
+        thread.setDaemon(true);
+        return thread;
+    });
+    // One thread, so add-on changes reach the cluster in the order they were made.
+    private final ExecutorService addonRunner = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "floci-eks-addon");
         thread.setDaemon(true);
         return thread;
     });
@@ -654,6 +661,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     public void shutdown() {
         poller.shutdownNow();
         updateRunner.shutdownNow();
+        addonRunner.shutdownNow();
         if (!config.services().eks().mock()) {
             boolean keepRunning = config.services().eks().keepRunningOnShutdown();
             for (Cluster cluster : allClusters()) {
@@ -775,6 +783,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setStatus(ClusterStatus.CREATING);
         cluster.setPlatformVersion("eks.1");
         cluster.setCertificateAuthority(new CertificateAuthority(""));
+        cluster.setMetricsServer(false);
 
         try {
             String issuer = oidcService.newIssuerUrl(region);
@@ -1842,6 +1851,38 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             return UPDATE_PARAMS.writeValueAsString(value);
         } catch (JsonProcessingException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Runs k3s's bundled metrics-server once the {@code metrics-server} add-on is installed. EKS ships no
+     * metrics-server; its community add-on of that name deploys one.
+     */
+    public void addonInstalled(String clusterName, String addonName) {
+        if (!METRICS_SERVER_ADDON.equalsIgnoreCase(addonName)) {
+            return;
+        }
+        Cluster cluster = describeCluster(clusterName);
+        cluster.setMetricsServer(true);
+        putCluster(cluster);
+        if (runsContainer(cluster)) {
+            addonRunner.execute(() -> clusterManager.setMetricsServerRunning(cluster, true));
+        }
+    }
+
+    /**
+     * Removes the bundled metrics-server when the {@code metrics-server} add-on is deleted, unless the
+     * deletion preserves the add-on's software, as {@code preserve} does in EKS.
+     */
+    public void addonRemoved(String clusterName, String addonName, boolean preserve) {
+        if (!METRICS_SERVER_ADDON.equalsIgnoreCase(addonName) || preserve) {
+            return;
+        }
+        Cluster cluster = describeCluster(clusterName);
+        cluster.setMetricsServer(false);
+        putCluster(cluster);
+        if (runsContainer(cluster)) {
+            addonRunner.execute(() -> clusterManager.setMetricsServerRunning(cluster, false));
         }
     }
 

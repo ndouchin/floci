@@ -12,9 +12,15 @@ default region cannot change the result. Nothing is hand-typed. Without AWS
 credentials (CI), `--check` only verifies the vendored file parses, keeps its shape, and covers
 every add-on and Kubernetes version; a regeneration needs credentials.
 
+`--response FILE` merges the add-ons a saved, unfiltered `aws eks describe-addon-versions --region
+us-east-1` answer holds (its `addons` list, or one add-on object) in place of asking AWS for them,
+and keeps the vendored entries of every other add-on. The answer's own compatibilities are kept
+for each Kubernetes version Floci runs, which is what the filtered calls return.
+
 Run from anywhere in the repo:
     python3 tools/aws/regen_eks_addon_versions.py            # rewrite the vendored file in place
     python3 tools/aws/regen_eks_addon_versions.py --check    # exit 1 when the vendored file is malformed
+    python3 tools/aws/regen_eks_addon_versions.py --response metrics-server.json
 """
 from __future__ import annotations
 
@@ -40,6 +46,7 @@ ADDONS = [
     "eks-pod-identity-agent",
     "aws-ebs-csi-driver",
     "amazon-cloudwatch-observability",
+    "metrics-server",
 ]
 # Each field the catalog keeps and the JSON type Java reads it as; STRINGS is a list of strings.
 STRINGS = "list of strings"
@@ -174,9 +181,31 @@ def render(catalog: dict) -> str:
     return '{"addons":[\n' + ",\n".join(addons) + "\n]}\n"
 
 
+def saved_addons(path: Path) -> list[dict]:
+    """The add-ons of a saved DescribeAddonVersions answer: its `addons` list, the list itself, or one add-on."""
+    saved = json.loads(path.read_text())
+    if isinstance(saved, dict) and "addons" in saved:
+        saved = saved["addons"]
+    addons = saved if isinstance(saved, list) else [saved]
+    if not all(isinstance(addon, dict) and addon.get("addonName") in ADDONS for addon in addons):
+        raise ValueError(f"{path} holds an add-on that is not in ADDONS")
+    return addons
+
+
+def merge_saved(catalog: dict, addons: list[dict], cluster_versions: list[str]) -> dict:
+    """The vendored catalog with each saved add-on merged as the filtered calls would answer for it."""
+    entries = {entry["addonName"]: entry for entry in catalog.get("addons", [])}
+    for addon in addons:
+        entries[addon["addonName"]] = merge(addon["addonName"],
+                                            {version: {"addons": [addon]} for version in cluster_versions})
+    return {"addons": [entries[name] for name in ADDONS if name in entries]}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check", action="store_true", help="verify the vendored file instead of rewriting it")
+    parser.add_argument("--response", action="append", default=[], type=Path, metavar="FILE",
+                        help="merge the add-ons of a saved describe-addon-versions answer instead of asking AWS")
     args = parser.parse_args()
     try:
         cluster_versions = kubernetes_versions(CLUSTER_MANAGER.read_text())
@@ -189,8 +218,12 @@ def main() -> int:
             print(f"addon-versions.json: {problem}", file=sys.stderr)
         return 1 if problems else 0
     try:
-        catalog = {"addons": [merge(name, {version: describe(name, version) for version in cluster_versions})
-                              for name in ADDONS]}
+        if args.response:
+            catalog = merge_saved(json.loads(OUTPUT.read_text()),
+                                  [addon for path in args.response for addon in saved_addons(path)], cluster_versions)
+        else:
+            catalog = {"addons": [merge(name, {version: describe(name, version) for version in cluster_versions})
+                                  for name in ADDONS]}
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as error:
         detail = (getattr(error, "stderr", None) or "").strip() or error
         print(f"regen_eks_addon_versions: {detail}; the vendored file is unchanged", file=sys.stderr)

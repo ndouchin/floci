@@ -149,6 +149,12 @@ public class EksClusterManager
     static final String CONTAINERD_CERTS_LINK = "etc/containerd/certs.d";
     static final String POD_IDENTITY_MANIFEST_FILE = "floci-eks-pod-identity.yaml";
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
+    // k3s writes its bundled metrics-server manifests to this directory at every start, and applies none
+    // that has a <name>.skip file beside it. The file list is the same in every k3s release Floci maps.
+    static final String METRICS_SERVER_MANIFEST_DIR = "server/manifests/metrics-server";
+    static final List<String> METRICS_SERVER_MANIFESTS = List.of("aggregated-metrics-reader.yaml",
+            "auth-delegator.yaml", "auth-reader.yaml", "metrics-apiservice.yaml", "metrics-server-deployment.yaml",
+            "metrics-server-service.yaml", "resource-reader.yaml");
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
 
@@ -803,6 +809,7 @@ public class EksClusterManager
         injectEcrRegistryMirror(containerId, cluster);
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
+        holdBundledMetricsServer(containerId, cluster);
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -2293,6 +2300,62 @@ public class EksClusterManager
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no pod identity injection: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
+        }
+    }
+
+    /**
+     * Keeps k3s from deploying its bundled metrics-server in a (created, not-yet-started) container
+     * whose cluster has no {@code metrics-server} add-on, by dropping a {@code .skip} file beside each of
+     * its manifests. A cluster recorded before the add-on existed keeps whatever k3s deployed.
+     */
+    void holdBundledMetricsServer(String containerId, Cluster cluster) {
+        if (!Boolean.FALSE.equals(cluster.getMetricsServer())) {
+            return;
+        }
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            try (TarArchiveOutputStream tar = new TarArchiveOutputStream(out)) {
+                for (String manifest : METRICS_SERVER_MANIFESTS) {
+                    TarArchiveEntry entry = new TarArchiveEntry(METRICS_SERVER_MANIFEST_DIR + "/" + manifest + ".skip");
+                    entry.setSize(0);
+                    entry.setMode(0644);
+                    tar.putArchiveEntry(entry);
+                    tar.closeArchiveEntry();
+                }
+            }
+            byte[] archive = out.toByteArray();
+            RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, K3S_DATA_DIR,
+                    "metrics-server skip files", stream -> stream.write(archive),
+                    RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} runs k3s''s bundled metrics-server: could not copy its skip files: {1}",
+                    cluster.getName(), e.getMessage());
+        }
+    }
+
+    /**
+     * Starts or removes k3s's bundled metrics-server in a running cluster. Removing the skip files lets
+     * k3s apply the manifests on its next scan, within 15 seconds. Restoring them stops k3s from applying
+     * the manifests again; once a scan that started before them has had time to finish, Floci deletes
+     * what the manifests created and k3s's Addon records of them, which would otherwise keep k3s from
+     * applying the unchanged manifests the next time.
+     */
+    void setMetricsServerRunning(Cluster cluster, boolean running) {
+        String dir = K3S_DATA_DIR + "/" + METRICS_SERVER_MANIFEST_DIR;
+        String script = running
+                ? "rm -f " + dir + "/*.skip"
+                : "mkdir -p " + dir + " && for f in " + String.join(" ", METRICS_SERVER_MANIFESTS) + "; do "
+                        + "touch " + dir + "/$f.skip; done; sleep 5; "
+                        + "kubectl delete --ignore-not-found -f " + dir + "; "
+                        + "for f in " + String.join(" ", METRICS_SERVER_MANIFESTS) + "; do "
+                        + "kubectl -n kube-system delete --ignore-not-found addons.k3s.cattle.io \"${f%%.*}\"; done";
+        ContainerExec.Result result = execInContainerForResult(cluster.getContainerId(),
+                new String[]{"sh", "-c", script}, 60);
+        if (result.exitCode() != 0) {
+            LOG.warnv("Could not {0} the metrics-server of EKS cluster {1}: {2}", running ? "start" : "remove",
+                    cluster.getName(), result.stdout());
+        } else {
+            LOG.infov("{0} the metrics-server of EKS cluster {1}", running ? "Started" : "Removed", cluster.getName());
         }
     }
 

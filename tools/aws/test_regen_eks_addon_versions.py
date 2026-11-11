@@ -137,3 +137,45 @@ def test_a_failed_sync_reports_aws_and_leaves_the_file_unchanged(tmp_path, monke
     assert r.main() == 1
     assert output.read_text() == "vendored\n"
     assert "security token included in the request is expired" in capsys.readouterr().err
+
+
+def test_a_saved_answer_is_merged_like_the_filtered_calls_and_keeps_the_other_addons(tmp_path, monkeypatch):
+    output = tmp_path / "addon-versions.json"
+    vendored = {"addons": [r.merge("coredns", {"1.31": response("1.31", ("v1", True)),
+                                               "1.30": response("1.30", ("v1", True))})]}
+    output.write_text(r.render(vendored))
+    saved = response("1.31", ("v0.8.1-eksbuild.2", True), ("v0.8.0-eksbuild.1", False))["addons"][0]
+    saved["addonName"] = "metrics-server"
+    saved["addonVersions"][0]["compatibilities"].append(
+        {"clusterVersion": "1.30", "platformVersions": ["*"], "defaultVersion": True})
+    saved["addonVersions"][1]["compatibilities"][0]["clusterVersion"] = "1.27"
+    answer = tmp_path / "metrics-server.json"
+    answer.write_text(json.dumps(saved))
+    monkeypatch.setattr(r, "OUTPUT", output)
+    monkeypatch.setattr(r, "ADDONS", ["coredns", "metrics-server"])
+    monkeypatch.setattr(r, "kubernetes_versions", lambda source: ["1.31", "1.30"])
+    monkeypatch.setattr(sys, "argv", ["regen_eks_addon_versions.py", "--response", str(answer)])
+
+    def no_aws(addon_name, kubernetes_version):
+        raise AssertionError("a saved answer must not call AWS")
+    monkeypatch.setattr(r, "describe", no_aws)
+
+    catalog = r.merge_saved(vendored, [saved], ["1.31", "1.30"])
+    assert [entry["addonName"] for entry in catalog["addons"]] == ["coredns", "metrics-server"]
+    assert catalog["addons"][0] == vendored["addons"][0]
+    assert [v["addonVersion"] for v in catalog["addons"][1]["addonVersions"]] == ["v0.8.1-eksbuild.2"]
+    assert [c["clusterVersion"] for c in catalog["addons"][1]["addonVersions"][0]["compatibilities"]] == ["1.31", "1.30"]
+    assert set(catalog["addons"][1]) == {"addonName", "type", "owner", "publisher", "addonVersions"}
+    assert r.main() == 0
+    assert json.loads(output.read_text()) == catalog
+
+
+def test_a_saved_answer_for_an_unlisted_addon_is_refused(tmp_path):
+    answer = tmp_path / "other.json"
+    answer.write_text(json.dumps({"addons": [{"addonName": "kube-state-metrics", "addonVersions": []}]}))
+    try:
+        r.saved_addons(answer)
+    except ValueError as error:
+        assert "not in ADDONS" in str(error)
+    else:
+        raise AssertionError("an add-on outside ADDONS must be refused")
