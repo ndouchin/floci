@@ -88,6 +88,21 @@ class EksLoadBalancerControllerTest {
     }
 
     @Test
+    void aPassStartsNoApplianceOnceItsClusterIsClosed() {
+        kube.add(service("web", Map.of(), null));
+        kube.add(service("api", Map.of(), null));
+        EksLoadBalancerController controller = controller();
+
+        controller.reconcile(cluster, REGION, BACKENDS, () -> !appliances.running.isEmpty());
+
+        assertEquals(1, appliances.running.size(), "the cluster closed after the first appliance: "
+                + appliances.running);
+        controller.reconcile(cluster, REGION, BACKENDS, () -> true);
+        assertEquals(1, appliances.running.size(), "a closed cluster's pass changes nothing");
+        assertEquals(Map.of(), kube.published, "nor does it publish names to CoreDNS");
+    }
+
+    @Test
     void podsResolveTheNamesThroughCoreDnsUntilTheServiceGoes() {
         kube.add(service("web", Map.of(), null));
         EksLoadBalancerController controller = controller();

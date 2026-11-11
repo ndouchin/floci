@@ -1726,8 +1726,13 @@ public class EksClusterManager
         LOG.infov("Stopped k3s container for cluster {0}", cluster.getName());
     }
 
+    /**
+     * Removes the cluster network, after the appliances once more: one a load balancer pass started while the cluster
+     * stopped would otherwise keep the network, and itself, alive.
+     */
     private void removeClusterNetwork(Cluster cluster) {
         if (cluster.isAgentless() && cluster.getNodeNetwork() != null) {
+            loadBalancerRuntime().removeAll(cluster);
             lifecycleManager.removeNetwork(cluster.getNodeNetwork());
         }
     }

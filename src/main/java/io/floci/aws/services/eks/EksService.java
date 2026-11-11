@@ -93,6 +93,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -159,6 +160,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private int nodeSweeps;
     private final Set<String> loadBalancerPasses = ConcurrentHashMap.newKeySet();
     private final Set<String> loadBalancersClosed = ConcurrentHashMap.newKeySet();
+    private static final long LOAD_BALANCER_CLOSE_WAIT_MILLIS = 180_000;
     private final ExecutorService loadBalancerRunner = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "floci-eks-load-balancers");
         thread.setDaemon(true);
@@ -701,7 +703,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         if (nodeReconciler != null) {
             nodeReconciler.shutdown();
         }
-        loadBalancerRunner.shutdownNow();
+        closeAllLoadBalancers();
         updateRunner.shutdownNow();
         addonRunner.shutdownNow();
         if (!config.services().eks().mock()) {
@@ -2686,10 +2688,16 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 continue;
             }
             String key = entry.accountId() + "/" + cluster.getName();
-            if (loadBalancersClosed.contains(key) || isClusterDeleting(entry.accountId(), cluster)
-                    || !loadBalancerPasses.add(key)) {
-                continue;
+            // Checked and registered under the lock closeLoadBalancers takes, so a delete either sees this pass and
+            // waits for it, or this pass sees the delete and does not start.
+            synchronized (loadBalancerPasses) {
+                if (loadBalancersClosed.contains(key) || isClusterDeleting(entry.accountId(), cluster)
+                        || !loadBalancerPasses.add(key)) {
+                    continue;
+                }
             }
+            BooleanSupplier closed = () -> loadBalancersClosed.contains(key) || cluster.getStatus() != ClusterStatus.ACTIVE
+                    || isClusterDeleting(entry.accountId(), cluster);
             Map<String, String> backends = new LinkedHashMap<>();
             for (Nodegroup group : listNodeGroupsForCluster(cluster.getName(), entry.accountId())) {
                 for (EksNode node : group.getNodes()) {
@@ -2703,7 +2711,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 loadBalancerRunner.execute(() -> {
                     try {
                         RequestScopes.runAs(entry.accountId(), region,
-                                () -> loadBalancerController.reconcile(cluster, region, backends));
+                                () -> loadBalancerController.reconcile(cluster, region, backends, closed));
                     } catch (RuntimeException e) {
                         LOG.warnv(e, "Load balancer pass failed for EKS cluster {0}", cluster.getName());
                     } finally {
@@ -2716,14 +2724,39 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
     }
 
+    /** At shutdown, before the clusters stop: no pass starts another appliance, and the running one ends. */
+    private void closeAllLoadBalancers() {
+        synchronized (loadBalancerPasses) {
+            for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+                loadBalancersClosed.add(entry.accountId() + "/" + entry.value().getName());
+            }
+        }
+        loadBalancerRunner.shutdown();
+        try {
+            if (!loadBalancerRunner.awaitTermination(60, TimeUnit.SECONDS)) {
+                loadBalancerRunner.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            loadBalancerRunner.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /**
      * Keeps load balancer passes off a cluster being deleted, and waits for the one running, so no appliance starts
      * after the cluster's appliances are removed.
      */
     private void closeLoadBalancers(String key) {
-        loadBalancersClosed.add(key);
-        long deadline = System.currentTimeMillis() + 60_000;
-        while (loadBalancerPasses.contains(key) && System.currentTimeMillis() < deadline) {
+        synchronized (loadBalancerPasses) {
+            loadBalancersClosed.add(key);
+        }
+        // A closed pass stops at its next Service, so this waits for at most one appliance or kubectl call.
+        long deadline = System.currentTimeMillis() + LOAD_BALANCER_CLOSE_WAIT_MILLIS;
+        while (loadBalancerPasses.contains(key)) {
+            if (System.currentTimeMillis() >= deadline) {
+                LOG.warnv("A load balancer pass over EKS cluster {0} still runs; deleting the cluster anyway", key);
+                return;
+            }
             try {
                 Thread.sleep(200);
             } catch (InterruptedException e) {

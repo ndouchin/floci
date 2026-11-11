@@ -19,6 +19,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 import java.util.function.IntSupplier;
 
 /**
@@ -123,8 +124,16 @@ final class EksLoadBalancerController {
      * @param backendAddresses the address of each node Floci runs as a k3s agent of the cluster, by node name
      */
     void reconcile(Cluster cluster, String region, Map<String, String> backendAddresses) {
+        reconcile(cluster, region, backendAddresses, () -> false);
+    }
+
+    /**
+     * One pass, which stops at the next Service once {@code closed} answers true, so a cluster being deleted gets no
+     * appliance after its deletion has removed them.
+     */
+    void reconcile(Cluster cluster, String region, Map<String, String> backendAddresses, BooleanSupplier closed) {
         Optional<Kube.Snapshot> read = kube.snapshot(cluster);
-        if (read.isEmpty()) {
+        if (read.isEmpty() || closed.getAsBoolean()) {
             return;
         }
         Kube.Snapshot snapshot = read.get();
@@ -132,6 +141,9 @@ final class EksLoadBalancerController {
         Map<String, Record> known = records.computeIfAbsent(key(cluster), ignored -> new ConcurrentHashMap<>());
         Set<String> present = new HashSet<>();
         for (JsonNode service : snapshot.services()) {
+            if (closed.getAsBoolean()) {
+                return;
+            }
             EksLoadBalancerSpec spec = EksLoadBalancerSpec.from(service, cluster.getName(), region);
             present.add(spec.uid());
             try {
@@ -140,13 +152,16 @@ final class EksLoadBalancerController {
                         cleanUp(cluster, spec, known.remove(spec.uid()));
                     }
                 } else {
-                    ensure(cluster, spec, known, ready, snapshot.endpointSlices());
+                    ensure(cluster, spec, known, ready, snapshot.endpointSlices(), closed);
                 }
             } catch (RuntimeException e) {
                 LOG.debugv(e, "Load balancer of Service {0}/{1} in EKS cluster {2} not synced", spec.namespace(),
                         spec.name(), cluster.getName());
                 failed(cluster, spec, e.getMessage());
             }
+        }
+        if (closed.getAsBoolean()) {
+            return;
         }
         for (Map.Entry<String, Record> entry : List.copyOf(known.entrySet())) {
             if (!present.contains(entry.getKey())) {
@@ -183,7 +198,7 @@ final class EksLoadBalancerController {
     }
 
     private void ensure(Cluster cluster, EksLoadBalancerSpec spec, Map<String, Record> known,
-                        Map<String, String> ready, List<JsonNode> endpointSlices) {
+                        Map<String, String> ready, List<JsonNode> endpointSlices, BooleanSupplier closed) {
         if (!spec.hasCleanupFinalizer() && !patchFinalizers(cluster, spec, true)) {
             return;
         }
@@ -200,6 +215,9 @@ final class EksLoadBalancerController {
         List<String> backends = spec.localTrafficPolicy() ? localBackends(spec, ready, endpointSlices)
                 : List.copyOf(ready.values());
         List<EksLoadBalancerSpec.Port> forwarded = spec.ports().stream().filter(port -> port.nodePort() > 0).toList();
+        if (closed.getAsBoolean()) {
+            return;
+        }
         Appliances.Running running = appliances.ensure(cluster, new Appliances.Spec(record.applianceName, spec.uid(),
                 forwarded, backends, spec.sourceRanges()));
         names.put(cluster, record.hostname, running.address());

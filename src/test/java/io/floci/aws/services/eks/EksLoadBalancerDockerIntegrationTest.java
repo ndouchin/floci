@@ -132,8 +132,13 @@ class EksLoadBalancerDockerIntegrationTest {
         }
         assertTrue(appliancesOf(cluster, uid).isEmpty(), "the appliance goes with its Service");
 
+        String network = eksService.describeCluster(clusterName).getNodeNetwork();
         EksDockerNodegroups.teardown(eksService, clusterName);
         assertTrue(appliances(cluster).isEmpty(), "every appliance goes with the cluster");
+        Thread.sleep(10_000);
+        assertTrue(appliances(cluster).isEmpty(), "no pass starts an appliance once the cluster is gone");
+        assertTrue(dockerClient.listNetworksCmd().withNameFilter(network).exec().stream()
+                .noneMatch(found -> network.equals(found.getName())), "the cluster network goes with the cluster");
     }
 
     private List<String> appliancesOf(Cluster cluster, String serviceUid) {
