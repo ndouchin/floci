@@ -230,6 +230,8 @@ final class EksNodeAgents implements EksNodeReconciler.Runtime {
         if (config.services().eks().embeddedDns()) {
             builder.withEmbeddedDns();
         }
+        EksNodeLayout.dnsSearch(manager.clusterRegion(cluster)).forEach(builder::withDnsSearch);
+        EksNodeLayout.DNS_OPTIONS.forEach(builder::withDnsOption);
         if (config.services().eks().ecrRegistryMirror() && config.services().ecr().enabled()) {
             builder.withHostDockerInternalOnLinux();
         }

@@ -40,6 +40,17 @@ class EksNodeLayoutTest {
         assertEquals(expected, EksNodeLayout.ipNodeName(address, region));
     }
 
+    // A node resolves names as an instance with the VPC's default DHCP option set does: its domain name, ec2.internal
+    // in us-east-1 and <region>.compute.internal elsewhere, completes unqualified names, and ndots keeps its default
+    // of 1 (no search domain of the machine Floci runs on, whose ndots:5 multiplies every lookup).
+    // https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateDhcpOptions.html
+    @ParameterizedTest
+    @CsvSource({"us-east-1, ec2.internal", "eu-west-1, eu-west-1.compute.internal"})
+    void nodesSearchTheVpcsDhcpDomainWithTheDefaultNdots(String region, String domain) {
+        assertEquals(List.of(domain), EksNodeLayout.dnsSearch(region));
+        assertEquals(List.of("ndots:1"), EksNodeLayout.DNS_OPTIONS);
+    }
+
     @Test
     void resourceNodeNameIsTheInstanceIdInTheRegionsDomain() {
         assertEquals("i-0123456789abcdef0.ec2.internal", EksNodeLayout.resourceNodeName("i-0123456789abcdef0", "us-east-1"));

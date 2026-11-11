@@ -59,8 +59,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(RealEksProfile.class)
-// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
-@Timeout(value = 9, unit = TimeUnit.MINUTES)
+// Bounded cluster, node group and workload waits total 780 s; allow Docker setup and cleanup as well.
+@Timeout(value = 15, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
     private static final Logger LOG = Logger.getLogger(EksRegistryHostsDockerIntegrationTest.class);
@@ -230,7 +230,8 @@ class EksRegistryHostsDockerIntegrationTest {
         execInContainer(containerId, new String[]{"sh", "-c",
                 "cat << 'EOF' | kubectl apply -f -\n" + podYaml + "\nEOF"});
 
-        long deadline = System.currentTimeMillis() + 45000;
+        // A fresh node pulls the sandbox image first, as a new EKS node does.
+        long deadline = System.currentTimeMillis() + 150_000;
         boolean running = false;
         while (System.currentTimeMillis() < deadline) {
             ContainerExec.Result status = execInContainerWithExitCode(containerId,

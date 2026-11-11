@@ -63,6 +63,14 @@ final class EksNodeLayout {
         return AwsRegions.ec2PrivateIpDnsName(address, region);
     }
 
+    /** Resolver options of a node: ndots at the resolver's default, whatever the machine Floci runs on uses. */
+    static final List<String> DNS_OPTIONS = List.of("ndots:1");
+
+    /** The search domain of a node's resolver: the domain name of the VPC's default DHCP option set. */
+    static List<String> dnsSearch(String region) {
+        return List.of(AwsRegions.ec2PrivateDnsDomain(region));
+    }
+
     static String resourceNodeName(String instanceId, String region) {
         return instanceId + "." + AwsRegions.ec2PrivateDnsDomain(region);
     }

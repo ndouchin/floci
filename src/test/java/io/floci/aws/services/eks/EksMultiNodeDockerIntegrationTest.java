@@ -116,6 +116,10 @@ class EksMultiNodeDockerIntegrationTest {
             assertTrue(label(node, "topology.k8s.aws/zone-id").matches("use1-az[12]"));
             assertTrue(label(node, "eks.amazonaws.com/nodegroup-image").startsWith("ami-"));
         }
+        String resolvConf = ContainerExec.run(dockerClient, agents(cluster).getFirst().getId(),
+                new String[] {"cat", "/etc/resolv.conf"}, 30).stdout();
+        assertTrue(resolvConf.contains("search ec2.internal") && resolvConf.contains("ndots:1"),
+                "a node resolves as an instance with the VPC's default DHCP options: " + resolvConf);
         List<JsonNode> general = nodes.stream().filter(n -> "general".equals(label(n, "eks.amazonaws.com/nodegroup")))
                 .toList();
         assertEquals(2, general.size());
