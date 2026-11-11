@@ -1026,7 +1026,8 @@ public class EksClusterManager
     }
 
     /**
-     * Checks whether the k3s API server is ready by polling its /readyz endpoint.
+     * Checks whether the k3s API server is ready by polling its /readyz endpoint. A 401 or 403 means
+     * anonymous requests are refused, which only a serving API server does.
      */
     public boolean isReady(Cluster cluster) {
         // Prefer internalEndpoint (IP-based) for connectivity — works on both user-defined
@@ -1038,10 +1039,9 @@ public class EksClusterManager
             return false;
         }
 
-        // /livez endpoint on the k3s API server (usually unauthenticated)
-        String livezUrl = endpoint + "/livez";
+        String readyzUrl = endpoint + "/readyz";
         try {
-            HttpURLConnection conn = (HttpURLConnection) URI.create(livezUrl).toURL().openConnection();
+            HttpURLConnection conn = (HttpURLConnection) URI.create(readyzUrl).toURL().openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(2000);
             conn.setReadTimeout(2000);
@@ -1057,8 +1057,8 @@ public class EksClusterManager
     }
 
     /**
-     * Extracts the kubeconfig from the running k3s container, rewrites the server URL,
-     * and sets the certificate authority data on the cluster.
+     * Reads the certificate authority data from the running k3s container's kubeconfig onto the
+     * cluster, then brings the node in line with the cluster's node groups once it registers.
      */
     public void finalizeCluster(Cluster cluster) {
         String containerId = cluster.getContainerId();
