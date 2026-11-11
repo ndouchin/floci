@@ -26,6 +26,8 @@ import java.util.concurrent.TimeUnit;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
@@ -70,6 +72,12 @@ class EksClusterUpdateDockerIntegrationTest {
         Assumptions.assumeTrue(available, "Docker daemon must be available for EKS update tests");
     }
 
+    /**
+     * The control plane moves alone, keeping its data, and its managed node stays on its kubelet version until its
+     * node group is updated, which replaces the node with one of a new identity on the new version.
+     * https://docs.aws.amazon.com/eks/latest/userguide/update-cluster.html
+     * https://docs.aws.amazon.com/eks/latest/userguide/managed-node-update-behavior.html
+     */
     @Test
     void clusterAndNodegroupMoveOneMinorVersionUpKeepingTheirData() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
@@ -83,21 +91,28 @@ class EksClusterUpdateDockerIntegrationTest {
         cleanup.register(() -> {
             try {
                 eksService.deleteNodeGroup(clusterName, nodegroupName);
+                long deadline = System.currentTimeMillis() + 120_000;
+                while (!eksService.listNodeGroups(clusterName).isEmpty() && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(2000);
+                }
             } catch (RuntimeException ignored) {
                 // Already gone, or never created.
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
             eksService.deleteCluster(clusterName);
         });
         Cluster cluster = waitForActive(clusterName);
         String endpoint = cluster.getEndpoint();
         assertEquals(0, kubectl(cluster, "create", "configmap", "survives", "--from-literal=key=value").exitCode());
-        // The default node type, so the node group does not replace the node before the update.
         given().contentType(JSON)
                 .body("{\"nodegroupName\":\"" + nodegroupName + "\",\"subnets\":[\"subnet-12345678\"],"
                         + "\"instanceTypes\":[\"m5.large\"],\"nodeRole\":\"arn:aws:iam::000000000000:role/eks-node\"}")
                 .when().post("/clusters/" + clusterName + "/node-groups")
                 .then().statusCode(200);
-        cluster = waitForActive(clusterName);
+        waitForNodegroup(clusterName, nodegroupName);
+        JsonNode original = waitForNode(cluster, "v1.33.");
+        String originalName = original.path("metadata").path("name").asText();
 
         given().contentType(JSON).body("{\"version\":\"1.35\"}")
                 .when().post("/clusters/" + clusterName + "/updates")
@@ -120,8 +135,11 @@ class EksClusterUpdateDockerIntegrationTest {
                 .body("cluster.endpoint", equalTo(endpoint));
         cluster = eksService.describeCluster(clusterName);
         assertEquals(0, kubectl(cluster, "get", "configmap", "survives").exitCode(), "data must survive the update");
-        JsonNode node = waitForNode(cluster, "v1.34.");
-        assertEquals("1.33-eks-1", label(node, "eks.amazonaws.com/nodegroup-image"));
+        assertTrue(kubectl(cluster, "version", "-o", "json").stdout().contains("\"minor\": \"34\""),
+                "the API server runs the new version");
+        JsonNode kept = waitForNode(cluster, "v1.33.");
+        assertEquals(originalName, kept.path("metadata").path("name").asText(), "the node stays as it was");
+        assertTrue(label(kept, "eks.amazonaws.com/nodegroup-image").startsWith("ami-"));
 
         given().contentType(JSON).body("{\"version\":\"1.35\"}")
                 .when().post("/clusters/" + clusterName + "/node-groups/" + nodegroupName + "/update-version")
@@ -136,16 +154,25 @@ class EksClusterUpdateDockerIntegrationTest {
                 .then().statusCode(200)
                 .body("nodegroup.status", equalTo("ACTIVE"))
                 .body("nodegroup.version", equalTo("1.34"))
-                .body("nodegroup.releaseVersion", equalTo("1.34-eks-1"));
-        long deadline = System.currentTimeMillis() + 120_000;
-        while (!"1.34-eks-1".equals(label(waitForNode(cluster, "v1.34."), "eks.amazonaws.com/nodegroup-image"))) {
-            if (System.currentTimeMillis() > deadline) {
-                fail("The node did not get the node group's new image label");
-            }
-            Thread.sleep(2000);
-        }
+                .body("nodegroup.releaseVersion", equalTo(EksNodeLayout.releaseVersion("1.34")));
+        JsonNode replaced = waitForNode(cluster, "v1.34.");
+        assertNotEquals(originalName, replaced.path("metadata").path("name").asText(),
+                "the update replaces the node with a new instance");
         given().when().get("/clusters/" + clusterName + "/updates")
                 .then().statusCode(200).body("updateIds", equalTo(List.of(updateId)));
+    }
+
+    private void waitForNodegroup(String clusterName, String nodegroupName) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 300_000;
+        while (System.currentTimeMillis() < deadline) {
+            String status = given().when().get("/clusters/" + clusterName + "/node-groups/" + nodegroupName)
+                    .then().statusCode(200).extract().path("nodegroup.status");
+            if ("ACTIVE".equals(status)) {
+                return;
+            }
+            Thread.sleep(3000);
+        }
+        fail("Node group " + nodegroupName + " did not become ACTIVE");
     }
 
     private Cluster waitForActive(String clusterName) throws InterruptedException {
@@ -191,6 +218,15 @@ class EksClusterUpdateDockerIntegrationTest {
                 JsonNode items = MAPPER.readTree(result.stdout()).path("items");
                 if (items.size() == 1) {
                     last = items.get(0);
+                    boolean ready = false;
+                    for (JsonNode condition : last.path("status").path("conditions")) {
+                        ready |= "Ready".equals(condition.path("type").asText())
+                                && "True".equals(condition.path("status").asText());
+                    }
+                    if (!ready) {
+                        Thread.sleep(2000);
+                        continue;
+                    }
                     if (last.path("status").path("nodeInfo").path("kubeletVersion").asText().startsWith(kubeletPrefix)) {
                         return last;
                     }

@@ -71,8 +71,10 @@ class EksMetricsServerAddonDockerIntegrationTest {
                 .body("{\"name\":\"" + clusterName + "\",\"roleArn\":\"arn:aws:iam::000000000000:role/eks\"}")
                 .when().post("/clusters")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteCluster(clusterName));
+        cleanup.register(() -> EksDockerNodegroups.teardown(eksService, clusterName));
         Cluster cluster = waitForActive(clusterName);
+        // metrics-server runs on a node; a cluster has none until a node group gives it one.
+        EksDockerNodegroups.createOneNode(clusterName, "workers");
 
         // k3s applies every bundled manifest in one pass, so once CoreDNS exists metrics-server would too.
         waitFor(cluster, "the CoreDNS deployment", "get", "deployment", "-n", "kube-system", "coredns");
@@ -89,6 +91,7 @@ class EksMetricsServerAddonDockerIntegrationTest {
                 .body("addon.status", equalTo("ACTIVE"));
         waitFor(cluster, "the metrics API to be available", "wait", "--for=condition=Available", "--timeout=5s",
                 "apiservice/v1beta1.metrics.k8s.io");
+        waitFor(cluster, "node metrics through the agent's tunnel", "top", "nodes");
 
         given().when().delete("/clusters/" + clusterName + "/addons/metrics-server")
                 .then().statusCode(200);

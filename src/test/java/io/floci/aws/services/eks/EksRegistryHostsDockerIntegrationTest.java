@@ -34,6 +34,7 @@ import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPOutputStream;
@@ -59,7 +60,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 @TestProfile(RealEksProfile.class)
 // Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
-@Timeout(value = 6, unit = TimeUnit.MINUTES)
+@Timeout(value = 9, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
     private static final Logger LOG = Logger.getLogger(EksRegistryHostsDockerIntegrationTest.class);
@@ -76,9 +77,6 @@ class EksRegistryHostsDockerIntegrationTest {
 
     @Inject
     Ec2Service ec2Service;
-
-    @Inject
-    EksClusterManager eksClusterManager;
 
     @Inject
     EksService eksService;
@@ -113,21 +111,14 @@ class EksRegistryHostsDockerIntegrationTest {
                         + "\"arn:aws:iam::000000000000:role/eks-service-role\"}")
                 .when().post("/clusters")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteCluster(clusterName));
+        cleanup.register(() -> EksDockerNodegroups.teardown(eksService, clusterName));
 
         Cluster cluster = eksService.describeCluster(clusterName);
         assertNotNull(cluster.getContainerId(), "Container ID must not be null");
         waitUntilReady(cluster);
-        eksClusterManager.finalizeCluster(cluster);
         String containerId = cluster.getContainerId();
 
-        // Verify symlink was created before container started
-        ContainerExec.Result linkResult = execInContainerWithExitCode(containerId,
-                new String[]{"readlink", "/etc/containerd/certs.d"});
-        assertEquals(0, linkResult.exitCode(), "readlink /etc/containerd/certs.d must succeed");
-        assertEquals(EksClusterManager.CONTAINERD_CERTS_TARGET, linkResult.stdout().trim());
-
-        // Configure registry host via node group launch template user data
+        // Configure registry host via node group launch template user data, which EC2 runs on each node it launches
         String endpoint = "http://" + dockerHostResolver.resolve() + ":" + httpPort;
         String userDataScript = """
                 MIME-Version: 1.0
@@ -169,41 +160,40 @@ class EksRegistryHostsDockerIntegrationTest {
                         """.formatted(nodegroupName, lt.getLaunchTemplateId()))
                 .when().post("/clusters/" + clusterName + "/node-groups")
                 .then().statusCode(200);
-        cleanup.register(() -> eksService.deleteNodeGroup(clusterName, nodegroupName));
+        EksDockerNodegroups.awaitActive(clusterName, nodegroupName);
+        String agentId = dockerClient.listContainersCmd().withShowAll(true)
+                .withLabelFilter(Map.of("io.floci.eks.cluster", cluster.getDockerName(), "io.floci.eks.role", "node"))
+                .exec().getFirst().getId();
 
-        // Re-read cluster and container ID: applying the first node group replaces the k3s container
-        // to apply node capacity limits, invalidating the previous container ID.
-        cluster = eksService.describeCluster(clusterName);
-        assertNotNull(cluster.getContainerId(), "Container ID must not be null after node group creation");
-        waitUntilReady(cluster);
-        containerId = cluster.getContainerId();
-
-        // Verify user data script wrote hosts.toml into k3s certs.d through the symlink
-        String hostsToml = execInContainer(containerId, new String[]{"cat",
+        // The certs.d link was put in before the node's agent started, and the user data wrote through it
+        ContainerExec.Result linkResult = execInContainerWithExitCode(agentId,
+                new String[]{"readlink", "/etc/containerd/certs.d"});
+        assertEquals(0, linkResult.exitCode(), "readlink /etc/containerd/certs.d must succeed on the node");
+        assertEquals(EksClusterManager.CONTAINERD_CERTS_TARGET, linkResult.stdout().trim());
+        String hostsToml = execInContainer(agentId, new String[]{"cat",
                 EksClusterManager.CONTAINERD_CERTS_TARGET + "/" + host + "/hosts.toml"});
         assertTrue(hostsToml.contains("\"X-Floci-Test\" = \"registry-hosts\""),
-                "the configured header must be present in the container's hosts.toml via the certs.d symlink");
+                "the configured header must be present in the node's hosts.toml via the certs.d symlink");
 
-        // Verify hosts.toml survives container restart
-        dockerClient.restartContainerCmd(containerId).exec();
+        // Verify hosts.toml survives a restart of the node
+        dockerClient.restartContainerCmd(agentId).exec();
         Instant restartCompletedAt = Instant.now();
-        waitUntilReady(cluster);
         String hostsTomlAfterRestart = null;
         long restartDeadline = System.currentTimeMillis() + 30000;
         while (System.currentTimeMillis() < restartDeadline) {
             try {
-                hostsTomlAfterRestart = execInContainer(containerId, new String[]{"cat",
+                hostsTomlAfterRestart = execInContainer(agentId, new String[]{"cat",
                         EksClusterManager.CONTAINERD_CERTS_TARGET + "/" + host + "/hosts.toml"});
                 break;
             } catch (Exception ignored) {
                 Thread.sleep(1000);
             }
         }
-        assertNotNull(hostsTomlAfterRestart, "hosts.toml must survive container restart");
+        assertNotNull(hostsTomlAfterRestart, "hosts.toml must survive a restart of the node");
         assertTrue(hostsTomlAfterRestart.contains("\"X-Floci-Test\" = \"registry-hosts\""),
-                "the configured header must survive container restart");
+                "the configured header must survive a restart of the node");
 
-        long saDeadline = System.currentTimeMillis() + 30000;
+        long saDeadline = System.currentTimeMillis() + 60000;
         boolean ready = false;
         while (System.currentTimeMillis() < saDeadline) {
             ContainerExec.Result saResult = execInContainerWithExitCode(containerId,
@@ -224,7 +214,7 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(1000);
         }
-        assertTrue(ready, "serviceaccount and Ready nodes with renewed Leases must be available within 30 seconds");
+        assertTrue(ready, "serviceaccount and a Ready node with a renewed Lease must be available within 60 seconds");
 
         String podYaml = """
                 apiVersion: v1
@@ -253,6 +243,7 @@ class EksRegistryHostsDockerIntegrationTest {
         }
         if (!running) {
             logPodDiagnostics(containerId);
+            logPodDiagnostics(agentId);
         }
         assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
