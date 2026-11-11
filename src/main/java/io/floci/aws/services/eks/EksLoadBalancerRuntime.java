@@ -19,6 +19,7 @@ import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.services.eks.model.Cluster;
 import org.jboss.logging.Logger;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -58,6 +59,8 @@ final class EksLoadBalancerRuntime implements EksLoadBalancerController.Kube, Ek
     private static final String NAMES_ENV = "FLOCI_LB_NAMES";
     static final String COREDNS_CUSTOM = "coredns-custom";
     static final String COREDNS_KEY = "floci-load-balancers.server";
+    static final String COREDNS_HOSTS_KEY = "floci-load-balancers.hosts";
+    private static final String HOSTS_ENV = "FLOCI_LB_HOSTS";
     private static final int KUBECTL_TIMEOUT_SECONDS = 30;
 
     private final EksClusterManager manager;
@@ -137,10 +140,8 @@ final class EksLoadBalancerRuntime implements EksLoadBalancerController.Kube, Ek
         event.put("lastTimestamp", now);
         event.put("count", 1);
         try {
-            ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(),
-                    cluster.getContainerId(), new String[]{"sh", "-c", "printf %s \"$" + EVENT_ENV
-                            + "\" | kubectl create -f -"}, List.of(EVENT_ENV + "=" + event), KUBECTL_TIMEOUT_SECONDS,
-                    null, null);
+            ContainerExec.Result result = shell(cluster, "printf %s \"$" + EVENT_ENV + "\" | kubectl create -f -",
+                    List.of(EVENT_ENV + "=" + event));
             if (result.exitCode() != 0) {
                 LOG.debugv("Could not record event {0} on Service {1}/{2}: {3}", reason, spec.namespace(),
                         spec.name(), result.summary());
@@ -152,44 +153,76 @@ final class EksLoadBalancerRuntime implements EksLoadBalancerController.Kube, Ek
     }
 
     /**
-     * Writes the cluster's load balancer names into the {@code coredns-custom} ConfigMap, which k3s's CoreDNS imports
-     * ({@code import /etc/coredns/custom/*.server}), under a key of Floci's own, so keys a user put there stay. Written
-     * only when the names change; CoreDNS picks a change up within about a minute, once the kubelet has synced the
-     * ConfigMap and CoreDNS reloaded.
+     * Writes the cluster's load balancer names into the {@code coredns-custom} ConfigMap, under keys of Floci's own, so
+     * keys a user put there stay: a server block for the region's ELB zones, which k3s's CoreDNS imports
+     * ({@code import /etc/coredns/custom/*.server}) when it loads its configuration, and the hosts file it answers
+     * from, which the {@code hosts} plugin rereads every 5 seconds once the kubelet has synced the ConfigMap. The block
+     * goes in on the cluster's first pass, before CoreDNS has a node to start on; CoreDNS pods already running when
+     * Floci creates the ConfigMap are restarted once, since CoreDNS does not reload for a newly imported file.
      */
     @Override
     public void publishNames(Cluster cluster, String region, Map<String, String> addressesByHostname) {
-        String block = addressesByHostname.isEmpty() ? "" : coreDnsServerBlock(region, addressesByHostname);
+        String block = coreDnsServerBlock(region);
+        String hosts = coreDnsHosts(addressesByHostname);
         String key = cluster.getDockerName();
-        if (block.equals(publishedBlocks.get(key))) {
+        String published = block + "\n" + hosts;
+        if (published.equals(publishedBlocks.get(key))) {
             return;
         }
-        String patch = block.isEmpty()
-                ? "{\"data\":{\"" + COREDNS_KEY + "\":null}}"
-                : JSON.createObjectNode().set("data", JSON.createObjectNode().put(COREDNS_KEY, block)).toString();
+        String patch = JSON.createObjectNode().set("data", JSON.createObjectNode().put(COREDNS_KEY, block)
+                .put(COREDNS_HOSTS_KEY, hosts)).toString();
         ContainerExec.Result patched = kubectl(cluster, List.of("-n", "kube-system", "patch", "configmap",
                 COREDNS_CUSTOM, "--type=merge", "-p", patch));
         boolean written = patched.exitCode() == 0;
         if (!written && patched.stdout().contains("NotFound")) {
-            written = block.isEmpty() || ContainerExec.run(lifecycleManager.getDockerClient(), cluster.getContainerId(),
-                    new String[]{"sh", "-c", "kubectl -n kube-system create configmap " + COREDNS_CUSTOM
-                            + " --from-literal=" + COREDNS_KEY + "=\"$" + NAMES_ENV + "\""},
-                    List.of(NAMES_ENV + "=" + block), KUBECTL_TIMEOUT_SECONDS, null, null).exitCode() == 0;
+            boolean coreDnsRunning = !kubectl(cluster, List.of("-n", "kube-system", "get", "pods", "-l",
+                    "k8s-app=kube-dns", "-o", "name")).stdout().isBlank();
+            written = shell(cluster, "kubectl -n kube-system create configmap " + COREDNS_CUSTOM
+                    + " --from-literal=" + COREDNS_KEY + "=\"$" + NAMES_ENV + "\""
+                    + " --from-literal=" + COREDNS_HOSTS_KEY + "=\"$" + HOSTS_ENV + "\"",
+                    List.of(NAMES_ENV + "=" + block, HOSTS_ENV + "=" + hosts)).exitCode() == 0;
+            if (written && coreDnsRunning) {
+                kubectl(cluster, List.of("-n", "kube-system", "rollout", "restart", "deployment/coredns"));
+            }
         }
         if (written) {
-            publishedBlocks.put(key, block);
+            publishedBlocks.put(key, published);
         }
     }
 
-    /** A CoreDNS server block for the region's two ELB DNS zones, answering each name with its appliance's address. */
-    static String coreDnsServerBlock(String region, Map<String, String> addressesByHostname) {
+    /** A CoreDNS server block for the region's two ELB DNS zones, answering from the hosts file Floci keeps. */
+    static String coreDnsServerBlock(String region) {
         String suffix = AwsRegions.dnsSuffixFor(region);
-        StringBuilder block = new StringBuilder();
-        block.append(region).append(".elb.").append(suffix).append(":53 elb.").append(region).append('.')
-                .append(suffix).append(":53 {\n    hosts {\n");
+        return region + ".elb." + suffix + ":53 elb." + region + "." + suffix + ":53 {\n"
+                + "    hosts /etc/coredns/custom/" + COREDNS_HOSTS_KEY + " {\n"
+                + "        ttl 30\n"
+                + "        reload 5s\n"
+                + "        fallthrough\n"
+                + "    }\n"
+                + "    forward . /etc/resolv.conf\n"
+                + "}\n";
+    }
+
+    /** The hosts file of the load balancer names: each name with its appliance's address. */
+    static String coreDnsHosts(Map<String, String> addressesByHostname) {
+        StringBuilder hosts = new StringBuilder();
         new TreeMap<>(addressesByHostname).forEach((hostname, address) ->
-                block.append("        ").append(address).append(' ').append(hostname).append('\n'));
-        return block.append("        fallthrough\n    }\n    forward . /etc/resolv.conf\n}\n").toString();
+                hosts.append(address).append(' ').append(hostname).append('\n'));
+        return hosts.toString();
+    }
+
+    private ContainerExec.Result shell(Cluster cluster, String script, List<String> env) {
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+        try {
+            ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(),
+                    cluster.getContainerId(), new String[]{"sh", "-c", script}, env, KUBECTL_TIMEOUT_SECONDS, stdout,
+                    stderr);
+            return new ContainerExec.Result(result.exitCode(), stdout.toString(StandardCharsets.UTF_8),
+                    stderr.toString(StandardCharsets.UTF_8) + result.stderr(), result.timedOut());
+        } catch (RuntimeException e) {
+            return new ContainerExec.Result(-1, "", String.valueOf(e.getMessage()), false);
+        }
     }
 
     void forget(Cluster cluster) {

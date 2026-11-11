@@ -38,22 +38,29 @@ class EksLoadBalancerRuntimeTest {
     }
 
     @Test
-    void coreDnsServerBlockAnswersBothElbZonesOfTheRegion() {
-        Map<String, String> names = new TreeMap<>(Map.of(
-                "a1b2-1234567890.us-east-1.elb.amazonaws.com", "10.250.0.130",
-                "k8s-default-web-0123456789-0123456789abcdef.elb.us-east-1.amazonaws.com", "10.250.0.131"));
-
-        String block = EksLoadBalancerRuntime.coreDnsServerBlock("us-east-1", names);
-
+    void coreDnsServerBlockAnswersBothElbZonesOfTheRegionFromAHostsFileItRereads() {
         assertEquals("""
                 us-east-1.elb.amazonaws.com:53 elb.us-east-1.amazonaws.com:53 {
-                    hosts {
-                        10.250.0.130 a1b2-1234567890.us-east-1.elb.amazonaws.com
-                        10.250.0.131 k8s-default-web-0123456789-0123456789abcdef.elb.us-east-1.amazonaws.com
+                    hosts /etc/coredns/custom/floci-load-balancers.hosts {
+                        ttl 30
+                        reload 5s
                         fallthrough
                     }
                     forward . /etc/resolv.conf
                 }
-                """, block);
+                """, EksLoadBalancerRuntime.coreDnsServerBlock("us-east-1"));
+    }
+
+    @Test
+    void coreDnsHostsListEachLoadBalancerNameWithItsApplianceAddress() {
+        Map<String, String> names = new TreeMap<>(Map.of(
+                "a1b2-1234567890.us-east-1.elb.amazonaws.com", "10.250.0.130",
+                "k8s-default-web-0123456789-0123456789abcdef.elb.us-east-1.amazonaws.com", "10.250.0.131"));
+
+        assertEquals("""
+                10.250.0.130 a1b2-1234567890.us-east-1.elb.amazonaws.com
+                10.250.0.131 k8s-default-web-0123456789-0123456789abcdef.elb.us-east-1.amazonaws.com
+                """, EksLoadBalancerRuntime.coreDnsHosts(names));
+        assertEquals("", EksLoadBalancerRuntime.coreDnsHosts(Map.of()));
     }
 }
