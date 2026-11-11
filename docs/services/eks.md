@@ -361,7 +361,7 @@ When a node group specifies a `launchTemplate`, Floci resolves the launch templa
 
 ### Nodegroup labels, taints and capacity type
 
-When managed nodegroups are defined for a cluster, Floci applies their labels and taints to the Kubernetes worker node at startup via `--kubelet-arg` flags.
+When managed nodegroups are defined for a cluster, Floci applies their labels and taints to the Kubernetes worker node at startup via `--kubelet-arg` flags, and through the Kubernetes API once the node is running (see [Timing and post-start nodegroups](#timing-and-post-start-nodegroups)).
 
 #### Applied labels
 Floci configures `--kubelet-arg=node-labels=...` with the following entries:
@@ -383,7 +383,7 @@ Floci configures `--kubelet-arg=register-with-taints=...` using the taints speci
 Floci runs one k3s container per cluster. The worker node reflects the metadata of the first active nodegroup (ordered by `createdAt` ascending, then `nodegroupName`). If additional nodegroups are created on the same cluster, Floci logs a warning that only the first nodegroup provides node metadata to the shared node.
 
 #### Timing and post-start nodegroups
-Kubelet flags are fixed when the cluster container starts. For nodegroups created while the cluster is already running, metadata is recorded in the EKS store and Floci logs an informational message that labels and taints are not applied to the running node. Surviving cluster containers are adopted as-is without rebuilding kubelet flags on restore.
+The kubelet applies `node-labels` and `register-with-taints` only when it registers the node, and a node group created on an ACTIVE cluster is stored after the node registered. Floci therefore also puts the first node group's labels and taints on the running node through its API server: when a node group is created or deleted on an ACTIVE cluster, when its labels or taints are updated, and whenever a started, restored or replaced container's node registers (retried for two minutes while the node is not there yet). Floci records the keys it manages in the node annotations `floci.io/eks-nodegroup-labels` and `floci.io/eks-nodegroup-taints`, so a later sync removes only the labels and taints it put there and keeps those a workload or an operator added; deleting the last node group removes them. The zone, region and instance-type labels are overwritten but never removed, and `beta.kubernetes.io/instance-type` is set to the same value as `node.kubernetes.io/instance-type`, because the cloud node controller embedded in k3s treats the beta label as the source of truth and resets the GA label to it ([cloud-provider `node_controller.go`](https://github.com/kubernetes/cloud-provider/blob/v0.33.1/controllers/node/node_controller.go)). A taint is identified by its key and effect, as Kubernetes identifies it. Surviving cluster containers are adopted as-is without rebuilding kubelet flags on restore; the API sync brings their node in line.
 
 ### Metadata only inputs
 
