@@ -1297,8 +1297,8 @@ public class ResourceArnBuilder {
      * in an id the request does not carry, or {@code *} when EKS holds none to act on; listing or creating
      * them, and every other route under a cluster, act on the cluster. The path is split as the router
      * splits it, before decoding, so an encoded {@code /} stays inside a name, and an access entry's
-     * principal is the rest of the path, as EKS takes it. {@code DescribeUpdate} acts on the add-on its
-     * {@code addonName} names, since the updates EKS keeps are its add-ons', and otherwise on the cluster. A
+     * principal is the rest of the path, as EKS takes it. {@code DescribeUpdate} acts on the add-on or node
+     * group the update was made to, and otherwise on the cluster. A
      * tagging route acts on the caller's cluster named by what follows the ARN's last {@code /}, as EKS tags
      * it, whatever the ARN names before that. Deregistering a cluster acts on that cluster, and an EKS
      * Anywhere subscription route on the subscription its id names. Listing clusters, registering one, the
@@ -1345,8 +1345,8 @@ public class ResourceArnBuilder {
             case "access-entries" -> eksHeldArn(cluster, collection,
                     pathSegment(String.join("/", List.of(segments).subList(3, accessEntryEnd(segments, method)))));
             case "updates" -> {
-                // The updates Floci keeps are its add-ons', and EKS returns one whether or not the request names
-                // its add-on, so the update is checked against the add-on it was made to.
+                // EKS returns an update whether or not the request names its add-on or node group, so the update
+                // is checked against the add-on, node group or cluster it was made to.
                 Optional<String> addon = segments.length == 4 && eksService != null
                         ? eksService.get().findResourceArn(cluster, collection, pathSegment(segments[3]))
                         : Optional.empty();

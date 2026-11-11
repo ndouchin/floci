@@ -6,6 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
@@ -23,6 +24,7 @@ import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
+import io.floci.aws.services.eks.model.AccessConfig;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterOidcKey;
@@ -42,6 +44,9 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateClusterVersionRequest;
+import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -69,11 +74,13 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -1054,6 +1061,7 @@ class EksServiceTest {
         Cluster cluster = activeClusterWithRunningNode(service, "deleted-node");
         service.createNodeGroup("deleted-node", nodeGroupRequest("first"));
         when(clusterManager.isReady(cluster)).thenAnswer(invocation -> {
+            service.deleteNodeGroup("deleted-node", "first");
             service.deleteCluster("deleted-node");
             return true;
         });
@@ -1076,7 +1084,15 @@ class EksServiceTest {
         }).when(clusterManager).stopCluster(any());
         AtomicReference<Throwable> deleteError = new AtomicReference<>();
         AtomicReference<Thread.State> deleterDuringSwap = new AtomicReference<>();
-        Thread deleter = deleteThread(service, "deleted-during-swap", deleteError);
+        // EKS deletes no cluster with node groups, so the delete removes the node group first.
+        Thread deleter = Thread.ofPlatform().unstarted(() -> {
+            try {
+                service.deleteNodeGroup("deleted-during-swap", "first");
+                service.deleteCluster("deleted-during-swap");
+            } catch (Throwable e) {
+                deleteError.set(e);
+            }
+        });
         when(clusterManager.restartForNodeCapacity(any(), anyString())).thenAnswer(invocation -> {
             // As replaceClusterContainer does: no container while the replacement starts.
             Cluster swapping = invocation.getArgument(0);
@@ -1093,7 +1109,8 @@ class EksServiceTest {
         assertEquals(Thread.State.BLOCKED, deleterDuringSwap.get());
         assertFalse(deleter.isAlive());
         assertNull(deleteError.get());
-        assertEquals(NodegroupStatus.ACTIVE, group.getStatus());
+        // Created once the swap finished, then deleted by the delete that waited for it.
+        assertEquals(NodegroupStatus.DELETING, group.getStatus());
         assertTrue(createdStorage("eks-clusters.json").get("deleted-during-swap").isEmpty());
         assertEquals(List.of("replacement-container"), stoppedContainers);
     }
@@ -1172,6 +1189,54 @@ class EksServiceTest {
         cluster.setContainerId("existing-container");
         cluster.setStatus(ClusterStatus.ACTIVE);
         return cluster;
+    }
+
+    @Test
+    void clusterVersionUpdateRecreatesTheNodeOnTheNewVersion() throws Exception {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.tryStartCluster(any())).thenReturn(true);
+        when(clusterManager.restartForVersion(any())).thenReturn(true);
+        when(clusterManager.isReady(any())).thenReturn(true);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "upgraded");
+
+        Update update = service.updateClusterVersion("upgraded", new UpdateClusterVersionRequest("1.30", null, null));
+
+        assertEquals("InProgress", update.status());
+        verify(clusterManager, timeout(5000)).finalizeCluster(cluster);
+        awaitStatus(cluster, ClusterStatus.ACTIVE);
+        assertEquals("1.30", cluster.getVersion());
+        assertTrue(cluster.isExplicitVersion());
+        verify(clusterManager).restartForVersion(cluster);
+    }
+
+    @Test
+    void aClusterDeletedDuringItsVersionUpdateIsNotWrittenBack() throws Exception {
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.tryStartCluster(any())).thenReturn(true);
+        when(clusterManager.restartForVersion(any())).thenReturn(true);
+        EksService service = newService(clusterManager, false);
+        Cluster cluster = activeClusterWithRunningNode(service, "doomed");
+        // The delete lands while the update waits for the new API server.
+        when(clusterManager.isReady(any())).thenAnswer(invocation -> {
+            service.deleteCluster("doomed");
+            return true;
+        });
+
+        service.updateClusterVersion("doomed", new UpdateClusterVersionRequest("1.30", null, null));
+
+        verify(clusterManager, timeout(5000)).finalizeCluster(cluster);
+        Thread.sleep(200);
+        assertTrue(createdStorage("eks-clusters.json").get("doomed").isEmpty());
+        assertThrows(AwsException.class, () -> service.describeCluster("doomed"));
+    }
+
+    private static void awaitStatus(Cluster cluster, ClusterStatus status) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (cluster.getStatus() != status && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
+        assertEquals(status, cluster.getStatus());
     }
 
     private static EksClusterManager capacitySwapManager(boolean swapSucceeds) {
@@ -1502,6 +1567,9 @@ class EksServiceTest {
         assertEquals(NodegroupStatus.ACTIVE,
                 service.createNodeGroup("probe-eks", nodeGroupRequest("ng-1")).getStatus());
 
+        AwsException inUse = assertThrows(AwsException.class, () -> service.deleteCluster("probe-eks"));
+        assertEquals("ResourceInUseException", inUse.getErrorCode());
+        service.deleteNodeGroup("probe-eks", "ng-1");
         service.deleteCluster("probe-eks");
         assertThrows(AwsException.class, () -> service.describeCluster("probe-eks"));
     }
@@ -2876,5 +2944,75 @@ class EksServiceTest {
         Cluster described = after.describeCluster("restart-args-cluster");
         assertEquals(List.of("--kubelet-arg=max-pods=250"), described.getClusterArgs());
         assertEquals(Map.of("owner", "ops"), described.getTags());
+    }
+
+    @Test
+    void createClusterRecordsTheCallingPrincipalAsCreator() {
+        IamService iam = mock(IamService.class);
+        RequestContext request = new RequestContext();
+        request.setAccessKeyId("ASIADEPLOY");
+        String role = "arn:aws:iam::000000000000:role/ci/deploy";
+        when(iam.resolveCallerArns("ASIADEPLOY")).thenReturn(Optional.of(new IamService.CallerArns(
+                "arn:aws:sts::000000000000:assumed-role/deploy/s", role, IamService.CallerArns.TYPE_ASSUMED_ROLE,
+                "AROADEPLOY:s", null)));
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        EksService service = creatorAwareService(iam, request, entries);
+
+        Cluster cluster = service.createCluster(createTestClusterRequest("creator-cluster"));
+
+        assertEquals(role, cluster.getCreatorArn());
+        verify(entries, never()).bootstrapCreatorEntry(any(), anyString(), any());
+    }
+
+    @Test
+    void unknownKeyMakesTheAccountRootTheCreator() {
+        IamService iam = mock(IamService.class);
+        when(iam.resolveCallerArns(any())).thenReturn(Optional.empty());
+        RequestContext request = new RequestContext();
+        request.setAccessKeyId("test");
+        EksService service = creatorAwareService(iam, request, mock(EksAccessEntryService.class));
+
+        Cluster cluster = service.createCluster(createTestClusterRequest("root-cluster"));
+
+        assertEquals("arn:aws:iam::000000000000:root", cluster.getCreatorArn());
+    }
+
+    @Test
+    void apiModesBootstrapTheCreatorEntryOnlyWhenAsked() {
+        IamService iam = mock(IamService.class);
+        String user = "arn:aws:iam::000000000000:user/admin";
+        when(iam.resolveCallerArns("AKIAADMIN")).thenReturn(Optional.of(new IamService.CallerArns(
+                user, user, IamService.CallerArns.TYPE_USER, "AIDAADMIN", "admin")));
+        RequestContext request = new RequestContext();
+        request.setAccessKeyId("AKIAADMIN");
+        EksAccessEntryService entries = mock(EksAccessEntryService.class);
+        EksService service = creatorAwareService(iam, request, entries);
+
+        CreateClusterRequest bootstrapped = createTestClusterRequest("api-bootstrap");
+        bootstrapped.setAccessConfig(new AccessConfig("API", null));
+        service.createCluster(bootstrapped);
+        CreateClusterRequest withheld = createTestClusterRequest("api-withheld");
+        withheld.setAccessConfig(new AccessConfig("API_AND_CONFIG_MAP", false));
+        service.createCluster(withheld);
+
+        verify(entries, times(1)).bootstrapCreatorEntry(any(), anyString(), any());
+        verify(entries).bootstrapCreatorEntry(any(), eq(user),
+                eq("AIDAADMIN"));
+    }
+
+    @Test
+    void configMapClustersRequireCreatorAdminPermissions() {
+        CreateClusterRequest request = createTestClusterRequest("configmap-no-bootstrap");
+        request.setAccessConfig(new AccessConfig("CONFIG_MAP", false));
+
+        AwsException ex = assertThrows(AwsException.class, () -> eksService.createCluster(request));
+
+        assertEquals("InvalidParameterException", ex.getErrorCode());
+    }
+
+    private EksService creatorAwareService(IamService iam, RequestContext request, EksAccessEntryService entries) {
+        return new EksService(storageFactory, testConfig(), regionResolver, null, null,
+                new EksOidcService(storageFactory, new ObjectMapper()), entries,
+                mock(EksPodIdentityAssociationService.class), null, iam, request);
     }
 }

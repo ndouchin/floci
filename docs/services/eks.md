@@ -12,7 +12,7 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `CreateCluster` | Create a new EKS cluster |
 | `DescribeCluster` | Describe a cluster by name |
 | `ListClusters` | List cluster names with pagination (`maxResults` 1-100 and `nextToken`) |
-| `DeleteCluster` | Delete a cluster |
+| `DeleteCluster` | Delete a cluster that has no node groups or Fargate profiles left |
 | `CreateAccessEntry` | Create STANDARD or EC2_LINUX access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
 | `ListAccessEntries` | List principal ARNs with pagination |
@@ -29,9 +29,14 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
 | `UpdateAddon` | Update addon configuration, version, or service account role |
-| `DescribeUpdate` | Describe an update for an addon |
+| `UpdateClusterVersion` | Move the cluster's Kubernetes version one minor version up |
+| `UpdateNodegroupConfig` | Change a node group's labels, taints, scaling, update, repair or warm pool configuration |
+| `UpdateNodegroupVersion` | Move a node group to its cluster's Kubernetes version, or another release or launch template version |
+| `DescribeUpdate` | Describe a cluster, node group or addon update |
+| `ListUpdates` | List the update IDs of a cluster, node group or addon, with pagination |
 | `DeleteAddon` | Delete an addon from a cluster |
 | `DescribeAddonVersions` | Describe supported addon versions by Kubernetes version or addon name |
+| `ListIdentityProviderConfigs` | List identity provider configs (always empty: they are not implemented) |
 | `CreateNodegroup` | Create node group metadata for a cluster |
 | `DescribeNodegroup` | Describe a node group by cluster and name |
 | `ListNodegroups` | List node group names for a cluster |
@@ -50,16 +55,60 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 
 The access-entry management operations support `STANDARD` (the default) and `EC2_LINUX`. STANDARD accepts existing IAM users or roles, including principals in another account. EC2_LINUX requires a role in the cluster account and generates `system:node:{{EC2PrivateDNSName}}`; custom usernames and Kubernetes groups are not accepted for node entries. Tags supplied at creation are preserved. Repeating a create with the same client token and normalized parameters returns the existing entry. Listing accepts `maxResults` from 1 to 100 and cluster-specific `nextToken` values.
 
-Access policies are management metadata, like the entries they belong to: Floci stores and returns them but does not enforce their Kubernetes permissions. `policyArn` must be an `arn:<partition>:eks::aws:cluster-access-policy/<name>` ARN in the cluster's partition. The policy name itself is not checked against AWS's list of access policies. The scope `type` is `cluster` (no namespaces) or `namespace` (one or more names; wildcards such as `dev-*` are kept as given, and a repeated name is stored once). Associating a policy that is already associated replaces its scope and keeps its `associatedAt`. Only STANDARD entries accept access policies, and deleting an entry removes its policies. Disassociating a policy the entry does not hold succeeds. `ListAccessEntries` accepts `associatedPolicyArn`.
+`policyArn` must be an `arn:<partition>:eks::aws:cluster-access-policy/<name>` ARN in the cluster's partition. The policy name itself is not checked against AWS's list of access policies. The scope `type` is `cluster` (no namespaces) or `namespace` (one or more names; wildcards such as `dev-*` are kept as given, and a repeated name is stored once). Associating a policy that is already associated replaces its scope and keeps its `associatedAt`. Only STANDARD entries accept access policies, and deleting an entry removes its policies. Disassociating a policy the entry does not hold succeeds. `ListAccessEntries` accepts `associatedPolicyArn`.
+
+Access policies are enforced as Kubernetes RBAC in real-mode clusters. The identity of a STANDARD entry carries one extra group, `floci:eks-access-entry:<principal ARN>`, and Floci binds that group to the ClusterRole each policy matches in the [EKS Best Practices Guide](https://docs.aws.amazon.com/eks/latest/best-practices/identity-and-access-management.html) table: `AmazonEKSClusterAdminPolicy` to `cluster-admin`, `AmazonEKSAdminPolicy` to `admin`, `AmazonEKSEditPolicy` to `edit` and `AmazonEKSViewPolicy` to `view`. A cluster scope becomes a ClusterRoleBinding; a namespace scope becomes a RoleBinding in each listed namespace that exists, and a name ending in `*` covers every existing namespace it prefixes. A namespace created after the association gets its RoleBinding the next time a principal holding the policy authenticates (Floci re-checks at most every 15 seconds). The bindings are named `floci-eks-<policy>-<hash>`, labelled `eks.floci.io/access-policy`, and reconciled as a whole when the cluster becomes ACTIVE and after every association, disassociation or deletion of an entry with policies, so a removed policy takes its bindings with it. Other access policies (for example `AmazonEKSAdminViewPolicy`) are stored and listed but grant nothing; Floci logs that once per cluster and policy. EKS evaluates access policies in its own authorizer, so in EKS these permissions appear in no RBAC object; in Floci the bindings are visible with `kubectl get clusterrolebindings,rolebindings -A -l eks.floci.io/access-policy`.
 
 The principal ARN in an access-entry path should be URL-encoded, as the SDKs and the CLI send it. Sent unencoded, a principal whose ARN ends in `/access-policies` (a role named `access-policies`) is read as the access-policies route of the shorter principal before it. A DELETE is a disassociate only when a cluster access policy ARN follows `access-policies`, so an entry with `access-policies` inside its IAM path can always be deleted.
 
 Access entries use EKS storage and retain the IAM principal's stable ID internally. Cluster deletion removes its entries, and a cluster recreated with the same name does not inherit previous entries or pagination tokens.
 
+### Cluster authentication
+
+Once a token is verified (see [Connecting with `kubectl`](#connecting-with-kubectl-native-aws-workflow)), Floci maps the caller's IAM principal to a Kubernetes identity the way EKS's [aws-iam-authenticator](https://github.com/kubernetes-sigs/aws-iam-authenticator/blob/master/pkg/server/server.go) does, or refuses it. A role session counts as its role: the principal is the role ARN, path included, as `aws:PrincipalArn` names it.
+
+`CreateCluster` records the IAM principal that called it as the cluster's creator, internal metadata that `DescribeCluster` does not return. A key IAM does not know, such as `test`, makes the account root (`arn:aws:iam::<account>:root`) the creator. What maps a principal then depends on `accessConfig.authenticationMode`, as the [cluster access guide](https://docs.aws.amazon.com/eks/latest/userguide/grant-k8s-access.html) lists the methods of each mode:
+
+| Mode | Principals mapped |
+|---|---|
+| `CONFIG_MAP` (API default) | The creator, as `kubernetes-admin` in `system:masters`; the `mapRoles` and `mapUsers` entries of the `kube-system/aws-auth` ConfigMap |
+| `API_AND_CONFIG_MAP` | Access entries, then `aws-auth`. An access entry wins for a principal in both, as the [migration guide](https://docs.aws.amazon.com/eks/latest/userguide/migrating-access-entries.html) states |
+| `API` | Access entries only |
+
+- **Creator.** In `CONFIG_MAP` the creator's mapping is permanent and appears in no ConfigMap or access entry, as the [best practices guide](https://docs.aws.amazon.com/eks/latest/best-practices/identity-and-access-management.html) describes; the `kubernetes-admin` username is not documented by AWS and is Floci's choice. In the two `API` modes the creator is mapped only through the access entry created when [`bootstrapClusterCreatorAdminPermissions`](https://docs.aws.amazon.com/eks/latest/APIReference/API_CreateAccessConfigRequest.html) is true, its default: a STANDARD entry with `AmazonEKSClusterAdminPolicy` at cluster scope, listed like any other entry and revoked by deleting it. The API reference only says "cluster admin access entry"; the policy name is what EKS associates in practice. `bootstrapClusterCreatorAdminPermissions=false` with `CONFIG_MAP` is rejected with `InvalidParameterException` ("bootstrapClusterCreatorAdminPermissions must be true if cluster authentication mode is set to CONFIG_MAP", the message EKS returns as quoted in [terraform-aws-eks#3026](https://github.com/terraform-aws-modules/terraform-aws-eks/issues/3026)); the best practices guide allows `false` only with `API_AND_CONFIG_MAP` or `API`.
+- **Identity.** An access entry gives its `username` (EKS's generated default is the user ARN, or `arn:aws:sts::<account>:assumed-role/<role>/{{SessionName}}` for a role, path removed, per [Create access entries](https://docs.aws.amazon.com/eks/latest/userguide/creating-access-entries.html)) and its `kubernetesGroups`, plus the access-policy group described above. An `aws-auth` entry gives its `username` and `groups`; `mapRoles` matches the role ARN without its path, as the [aws-auth guide](https://docs.aws.amazon.com/eks/latest/userguide/auth-configmap.html) requires, and both lists match case-insensitively. The templates `{{AccountID}}`, `{{SessionName}}` (with `@` replaced by `-`), `{{SessionNameRaw}}`, `{{AccessKeyID}}` and `{{EC2PrivateDNSName}}` are rendered. The TokenReview also carries the authenticator's `uid` (`aws-iam-authenticator:<account>:<userid>`) and `extra` keys (`arn`, `canonicalArn`, `sessionName`, `accessKeyId`, `principalId`).
+- **Refusal.** A principal nothing maps gets `401 Unauthorized` from the API server, as do federated-user sessions and a mapping whose template cannot be rendered.
+- **Root.** The creator must authenticate with credentials Floci can verify, and the public `test` keys are refused. For a cluster created with such a key, run `aws sts get-session-token` with that key and use the session for `aws eks get-token`: the session acts as the account root. Or create the cluster with the IAM user or role you then use with `kubectl`.
+- **Older clusters.** A cluster persisted before Floci recorded creators keeps the earlier mapping: every long-term key and STS session of the cluster's account is `floci:aws-iam` in `system:masters`, and a session of another account is refused. Floci logs this once per cluster; recreate the cluster for the behaviour above.
+
+Floci reads `aws-auth` from the cluster on every token review the API server does not answer from its cache, so an edit applies within the webhook cache TTL (30 seconds).
+
+```bash
+# CONFIG_MAP: the creator maps further principals through aws-auth.
+kubectl apply -f - <<'YAML'
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: aws-auth, namespace: kube-system}
+data:
+  mapRoles: |
+    - rolearn: arn:aws:iam::000000000000:role/deployer
+      username: deployer:{{SessionName}}
+      groups: [system:masters]
+YAML
+# API or API_AND_CONFIG_MAP: grant view on one namespace through an access entry.
+aws --endpoint-url http://localhost:4566 eks create-access-entry \
+  --cluster-name my-cluster --principal-arn arn:aws:iam::000000000000:user/dev
+aws --endpoint-url http://localhost:4566 eks associate-access-policy \
+  --cluster-name my-cluster --principal-arn arn:aws:iam::000000000000:user/dev \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy \
+  --access-scope type=namespace,namespaces=default
+```
+
 ### EC2 Linux worker authentication
 
 IMDS instance-profile credentials authenticate through a matching `EC2_LINUX` entry as
-`system:node:<private-DNS-name>` with `system:bootstrappers` and `system:nodes` groups.
+`system:node:<private-DNS-name>` with `system:bootstrappers` and `system:nodes` groups,
+or, in a `CONFIG_MAP` cluster, through an `aws-auth` `mapRoles` entry whose username uses `{{EC2PrivateDNSName}}`.
 The webhook verifies the signed token, cluster account/region/incarnation, stored role ID,
 running EC2 instance, and attached instance profile. Missing/deleted entries, recreated roles,
 revoked sessions and terminated instances are rejected without falling back to administrator access.
@@ -73,7 +122,7 @@ rejects instance credentials. Obtain fresh IMDS credentials after upgrading so t
 includes the stable role ID.
 
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, ListAccessPolicies, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Automatic managed-node entries are not created. Updating the authentication mode (`UpdateClusterConfig`), `UpdateAccessEntry`, `ListAccessPolicies`, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
@@ -146,17 +195,55 @@ Floci supports the EKS cluster addon management plane for AWS SDKs and Terraform
 
 ### Supported operations
 
-- **Creation**: `CreateAddon` creates an addon on an ACTIVE cluster. Supported addons are `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver`, and `amazon-cloudwatch-observability`. If `addonVersion` is omitted, the default version compatible with the cluster Kubernetes version is resolved automatically. Referenced `serviceAccountRoleArn` must exist in IAM. Idempotency is supported via `clientRequestToken`.
+- **Creation**: `CreateAddon` creates an addon on an ACTIVE cluster. Supported addons are `vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver`, `amazon-cloudwatch-observability`, and the `metrics-server` community add-on. If `addonVersion` is omitted, the default version compatible with the cluster Kubernetes version is resolved automatically. Referenced `serviceAccountRoleArn` must exist in IAM. Idempotency is supported via `clientRequestToken`.
 - **Retrieval**: `DescribeAddon` returns the complete addon resource shape, including ARN, cluster name, version, status (`ACTIVE`), health issues, tags, service account role ARN, configuration values, pod identity associations, owner, and publisher.
 - **Listing**: `ListAddons` lists installed addon names with pagination (`maxResults` and `nextToken`).
 - **Updating**: `UpdateAddon` updates the addon version, configuration values, service account role ARN, or resolve-conflicts strategy. It returns an `Update` tracking object and updates the addon metadata.
-- **Update tracking**: `DescribeUpdate` describes the status of an addon update (such as an in-place addon version update queried by Terraform).
+- **Update tracking**: `DescribeUpdate` describes the status of an addon update (such as an in-place addon version update queried by Terraform), and `ListUpdates` with `addonName` lists them. Addon updates are `Successful` as soon as they are made.
 - **Deletion**: `DeleteAddon` marks the addon as `DELETING` and removes it from the cluster. Deleting a cluster automatically cleans up all associated addons.
 - **Supported versions**: `DescribeAddonVersions` queries the addon version catalog with optional filtering by `addonName` and `kubernetesVersion`, supporting pagination. As in AWS, a `kubernetesVersion` filter also limits each version's `compatibilities` to that Kubernetes version. The catalog in `src/main/resources/eks/addon-versions.json` holds the parts of AWS's `DescribeAddonVersions` answer that Floci serves, for every Kubernetes version Floci can run; `make eks-addons-sync` regenerates it from `DescribeAddonVersions` with any AWS account's credentials.
 
 ### Metadata recording only
 
-Addons in Floci are recorded metadata only. Creating or updating an addon does not install or reconcile Kubernetes DaemonSets, Deployments, or custom resources inside the cluster container.
+Addons in Floci are recorded metadata only, except `metrics-server` (below). Creating or updating an addon does not install or reconcile Kubernetes DaemonSets, Deployments, or custom resources inside the cluster container.
+
+### Metrics Server
+
+"The Kubernetes Metrics Server ... isn't deployed by default in Amazon EKS clusters" ([Amazon EKS user guide](https://docs.aws.amazon.com/eks/latest/userguide/metrics-server.html)); it is installed as the `metrics-server` [community add-on](https://docs.aws.amazon.com/eks/latest/userguide/community-addons.html) (namespace `kube-system`, no service account or IAM policy) or from the upstream manifest. Floci matches this: k3s deploys its bundled metrics-server unless told not to, and Floci drops a [`.skip` file](https://docs.k3s.io/installation/packaged-components) beside each of its manifests in every new cluster, so `kubectl top` and the `metrics.k8s.io` API are absent. Creating the `metrics-server` add-on removes the skip files and k3s deploys its bundled metrics-server within 15 seconds (its manifest scan interval); deleting the add-on puts them back and deletes what the manifests created, unless `preserve` is set, which in EKS keeps the add-on's software running. The workload is k3s's build of metrics-server, not the EKS community build whose version the add-on reports. Clusters created before this change keep the metrics-server k3s gave them. In mock mode the add-on is metadata only.
+
+The `metrics-server` catalog entry was generated by `tools/aws/regen_eks_addon_versions.py --response` from the unfiltered `aws eks describe-addon-versions --region us-east-1` answer captured on 2026-10-24 by [plumdog/eks-addon-configuration](https://github.com/plumdog/eks-addon-configuration/blob/d5aff59926/data/metrics-server/addon.json) (MIT), since no AWS credentials were available to call the API; `make eks-addons-sync` refreshes it from AWS like the other add-ons.
+
+## Cluster deletion
+
+Deleting a cluster that still has managed node groups or Fargate profiles fails with `ResourceInUseException` (HTTP 409), as the [`DeleteCluster` reference](https://docs.aws.amazon.com/eks/latest/APIReference/API_DeleteCluster.html) requires ("If you have managed node groups or Fargate profiles attached to the cluster, you must delete them first"). The messages are those EKS returns: `Cluster has nodegroups attached` ([hashicorp/terraform#37560](https://github.com/hashicorp/terraform/issues/37560)) and `Cluster has Fargate Profiles in ACTIVE/CREATING state` ([terraform-provider-aws#12179](https://github.com/hashicorp/terraform-provider-aws/issues/12179)). A CloudFormation stack deletes its node groups first, since they reference the cluster.
+
+## Cluster and node group updates
+
+`UpdateClusterVersion`, `UpdateNodegroupConfig` and `UpdateNodegroupVersion` return an [`Update`](https://docs.aws.amazon.com/eks/latest/APIReference/API_Update.html) with status `InProgress`, as EKS does; poll `DescribeUpdate` until it is `Successful` or `Failed`. Repeating a call with the same `clientRequestToken` returns the update the first call started. Metadata-only clusters (mock mode, or no Docker daemon) finish an update as soon as it is recorded. [`ListUpdates`](https://docs.aws.amazon.com/eks/latest/APIReference/API_ListUpdates.html) lists the cluster's own updates, or with `nodegroupName` or `addonName` those of that node group or addon, oldest first, with `maxResults` from 1 to 100 and `nextToken`. `DescribeUpdate` returns an update whether or not the request names its node group or addon, and refuses one that names another. Updates in progress when Floci stops are marked `Failed` at the next start.
+
+### Cluster version
+
+[`UpdateClusterVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateClusterVersion.html) accepts the next minor version only. Any other version, including the current one and older ones, is refused with `InvalidParameterException` and the message EKS returns, `Unsupported Kubernetes minor version update from 1.33 to 1.35` (as reported in [rancher/rancher#41643](https://github.com/rancher/rancher/issues/41643); AWS does not document the message). As the API reference requires, every managed node group must run the cluster's current version first; otherwise the call fails with `InvalidRequestException` and `Nodegroups <names> must be updated to match cluster version <version> before updating cluster version`, the message seen in [terraform-provider-aws#19478](https://github.com/hashicorp/terraform-provider-aws/issues/19478) (the error code is not shown there; `InvalidRequestException` is Floci's reading of "the request is invalid given the state of the cluster"). `force` overrides nothing. A cluster that is not `ACTIVE`, or whose node is being replaced, answers `ResourceInUseException`.
+
+The update reports `Version` and `PlatformVersion` (`eks.1`) parameters, as in the API reference example. The cluster is `UPDATING` while Floci recreates its k3s container on the image of the new version, keeping the named data volume, so workloads and objects survive, and the published API port and certificate authority, so kubeconfigs stay valid. It returns to `ACTIVE` once the new API server answers `/readyz`, with `version` and `platformVersion` updated and the update `Successful`. If the new container cannot start, Floci restores the previous one and the update is `Failed`. Node group versions do not change: in EKS the nodes keep their kubelet until `UpdateNodegroupVersion`, but Floci's only node is the server's own kubelet, which runs the new version at once.
+
+A cluster created without `version` runs the configured default image (`rancher/k3s:latest`) while reporting 1.29. Recreating it on an older minor than that image runs would downgrade its data, which k3s does not support, so Floci refuses such an update with `InvalidRequestException`; create the cluster with an explicit version to update it.
+
+### Node group configuration
+
+[`UpdateNodegroupConfig`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupConfig.html) applies `labels` (`addOrUpdateLabels`, `removeLabels`), `taints` (`addOrUpdateTaints`, `removeTaints`, a taint being identified by its key and effect), `scalingConfig` (only the members sent change), `updateConfig`, `nodeRepairConfig` and `warmPoolConfig`. The update has type `ConfigUpdate` and one parameter per change: `MinSize`, `MaxSize` and `DesiredSize` as in the API reference example, `LabelsToAdd`, `LabelsToRemove`, `TaintsToAdd` and `TaintsToRemove` as JSON (the encoding of these four values is not documented by AWS and is Floci's choice), and `MaxUnavailable`, `MaxUnavailablePercentage`, `UpdateStrategy`, `NodeRepairEnabled` and the `WarmPool*` parameters. The node group is `UPDATING` until the change is stored and, for the first node group, its labels and taints are on the running node (see [Timing and post-start nodegroups](#timing-and-post-start-nodegroups)). Floci refuses with `InvalidParameterException` a label both added and removed, a taint without a key or with an effect other than `NO_SCHEDULE`, `NO_EXECUTE` or `PREFER_NO_SCHEDULE`, more than 50 taints, a scaling configuration that breaks `0 <= minSize <= desiredSize <= maxSize` with `maxSize >= 1`, and a request that changes nothing; these messages are Floci's. A node group or cluster that is not `ACTIVE` answers `ResourceInUseException`. `desiredSize` is recorded but does not add nodes: a cluster has one node.
+
+### Node group version
+
+[`UpdateNodegroupVersion`](https://docs.aws.amazon.com/eks/latest/APIReference/API_UpdateNodegroupVersion.html) moves a node group to `version`, by default the cluster's version, and `releaseVersion`, by default `<version>-eks-1`. A version newer than the cluster's, or older than the node group's ("You cannot roll back a node group to an earlier Kubernetes version"), is refused with `InvalidParameterException`. A `launchTemplate` is accepted only for a node group created with one and must name the same template ID or name, as the API reference requires; its version is resolved in EC2. The update has type `VersionUpdate` with `Version` and `ReleaseVersion` parameters, plus `LaunchTemplateName` and `LaunchTemplateVersion` when sent. Since the node already runs the control plane's version, only the node group record and the node's `eks.amazonaws.com/nodegroup-image` label change.
+
+```bash
+aws --endpoint-url http://localhost:4566 eks update-cluster-version --name my-cluster --kubernetes-version 1.34
+aws --endpoint-url http://localhost:4566 eks update-nodegroup-config --cluster-name my-cluster \
+  --nodegroup-name workers --labels 'addOrUpdateLabels={team=payments}' \
+  --taints 'addOrUpdateTaints=[{key=dedicated,value=batch,effect=NO_SCHEDULE}]'
+aws --endpoint-url http://localhost:4566 eks list-updates --name my-cluster --nodegroup-name workers
+```
 
 ## Cluster security group
 
@@ -361,7 +448,7 @@ When a node group specifies a `launchTemplate`, Floci resolves the launch templa
 
 ### Nodegroup labels, taints and capacity type
 
-When managed nodegroups are defined for a cluster, Floci applies their labels and taints to the Kubernetes worker node at startup via `--kubelet-arg` flags.
+When managed nodegroups are defined for a cluster, Floci applies their labels and taints to the Kubernetes worker node at startup via `--kubelet-arg` flags, and through the Kubernetes API once the node is running (see [Timing and post-start nodegroups](#timing-and-post-start-nodegroups)).
 
 #### Applied labels
 Floci configures `--kubelet-arg=node-labels=...` with the following entries:
@@ -383,7 +470,7 @@ Floci configures `--kubelet-arg=register-with-taints=...` using the taints speci
 Floci runs one k3s container per cluster. The worker node reflects the metadata of the first active nodegroup (ordered by `createdAt` ascending, then `nodegroupName`). If additional nodegroups are created on the same cluster, Floci logs a warning that only the first nodegroup provides node metadata to the shared node.
 
 #### Timing and post-start nodegroups
-Kubelet flags are fixed when the cluster container starts. For nodegroups created while the cluster is already running, metadata is recorded in the EKS store and Floci logs an informational message that labels and taints are not applied to the running node. Surviving cluster containers are adopted as-is without rebuilding kubelet flags on restore.
+The kubelet applies `node-labels` and `register-with-taints` only when it registers the node, and a node group created on an ACTIVE cluster is stored after the node registered. Floci therefore also puts the first node group's labels and taints on the running node through its API server: when a node group is created or deleted on an ACTIVE cluster, when its labels or taints are updated, and whenever a started, restored or replaced container's node registers (retried for two minutes while the node is not there yet). Floci records the keys it manages in the node annotations `floci.io/eks-nodegroup-labels` and `floci.io/eks-nodegroup-taints`, so a later sync removes only the labels and taints it put there and keeps those a workload or an operator added; deleting the last node group removes them. The zone, region and instance-type labels are overwritten but never removed, and `beta.kubernetes.io/instance-type` is set to the same value as `node.kubernetes.io/instance-type`, because the cloud node controller embedded in k3s treats the beta label as the source of truth and resets the GA label to it ([cloud-provider `node_controller.go`](https://github.com/kubernetes/cloud-provider/blob/v0.33.1/controllers/node/node_controller.go)). A taint is identified by its key and effect, as Kubernetes identifies it. Surviving cluster containers are adopted as-is without rebuilding kubelet flags on restore; the API sync brings their node in line.
 
 ### Metadata only inputs
 
@@ -415,9 +502,9 @@ aws eks update-kubeconfig --name my-cluster
 kubectl get nodes
 ```
 
-`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 15-minute token lifetime matching `aws-iam-authenticator` rather than the presigned expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before resolving the caller identity. Instance-profile sessions require an EC2_LINUX access entry as described above; non-worker callers retain the `system:masters` mapping (bound to `cluster-admin`). A long-term access key gets it only on clusters of its own account, so a default-account key is refused on another account's cluster; on the older unscoped webhook path only the default account's keys get it. No `aws-iam-authenticator` is required.
+`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 15-minute token lifetime matching `aws-iam-authenticator` rather than the presigned expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before mapping the caller's IAM principal as [Cluster authentication](#cluster-authentication) describes: the cluster creator, access entries and the `aws-auth` ConfigMap decide who gets in, and anyone else gets `401`. No `aws-iam-authenticator` is required.
 
-Create an IAM access key before using EKS authentication. The public local-development pairs `test`/`test` and `floci`/`floci` are deliberately rejected because the webhook grants cluster-admin access.
+Use IAM credentials Floci knows for EKS authentication: an IAM access key, or STS session credentials. The public local-development pairs `test`/`test` and `floci`/`floci` are deliberately rejected, since anyone can sign with them.
 
 Temporary IAM credentials must include their `AWS_SESSION_TOKEN` when signing the token.
 
@@ -1097,12 +1184,11 @@ eks.tagResource(r -> r
 eks.deleteCluster(r -> r.name("my-cluster"));
 ```
 
-## Not Implemented (Phase 1)
+## Not Implemented
 
 The following EKS features are not yet supported:
 
-- `UpdateClusterConfig` / `UpdateClusterVersion`
-- `UpdateNodegroupConfig` / `UpdateNodegroupVersion`
-- Add-ons (`CreateAddon`, `DescribeAddon`, `ListAddons`)
+- `UpdateClusterConfig` (endpoint access, logging, authentication mode and the other cluster configuration updates)
+- `CancelUpdate`, and `UpdateClusterVersion` rollbacks (`rollbackConfig`)
+- `UpdateAccessEntry` and `ListAccessPolicies`
 - Identity provider configs
-- Access policies

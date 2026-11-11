@@ -229,12 +229,14 @@ class EksAccessEntryIntegrationTest {
     }
 
     private static void createCluster(String account, String name, String mode) {
+        // EKS refuses to withhold the creator's admin permissions from a CONFIG_MAP cluster.
+        boolean bootstrap = "CONFIG_MAP".equals(mode);
         given().header("Authorization", auth(account, "eks")).contentType("application/json")
                 .body(Map.of("name", name, "roleArn", "arn:aws:iam::" + account + ":role/cluster",
-                        "accessConfig", Map.of("authenticationMode", mode, "bootstrapClusterCreatorAdminPermissions", false)))
+                        "accessConfig", Map.of("authenticationMode", mode, "bootstrapClusterCreatorAdminPermissions", bootstrap)))
                 .post("/clusters").then().statusCode(200)
                 .body("cluster.accessConfig.authenticationMode", equalTo(mode))
-                .body("cluster.accessConfig.bootstrapClusterCreatorAdminPermissions", equalTo(false));
+                .body("cluster.accessConfig.bootstrapClusterCreatorAdminPermissions", equalTo(bootstrap));
     }
 
     private static String auth(String account, String service) {

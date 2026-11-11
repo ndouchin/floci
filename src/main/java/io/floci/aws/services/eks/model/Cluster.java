@@ -135,6 +135,30 @@ public class Cluster {
 
     private AccessConfig accessConfig;
 
+    /**
+     * The IAM principal that created the cluster, as aws:PrincipalArn names it (a role session is
+     * its role). Internal persisted metadata omitted from AWS API responses; a record without it
+     * predates realistic cluster authentication.
+     */
+    @JsonProperty("creatorArn")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String creatorArn;
+
+    /**
+     * Whether k3s's bundled metrics-server runs: true once the {@code metrics-server} add-on is
+     * installed, false otherwise, as EKS ships no metrics-server. Internal persisted metadata omitted
+     * from AWS API responses; a record without it predates the add-on and keeps what k3s deployed.
+     */
+    @JsonProperty("metricsServer")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private Boolean metricsServer;
+
+    public String getCreatorArn() { return creatorArn; }
+    public void setCreatorArn(String creatorArn) { this.creatorArn = creatorArn; }
+
+    public Boolean getMetricsServer() { return metricsServer; }
+    public void setMetricsServer(Boolean metricsServer) { this.metricsServer = metricsServer; }
+
     public AccessConfig getAccessConfig() { return accessConfig; }
     public void setAccessConfig(AccessConfig accessConfig) { this.accessConfig = accessConfig; }
 
@@ -266,6 +290,8 @@ public class Cluster {
         c.defaultStorageClass = this.defaultStorageClass;
         c.joinedInstanceIds = this.joinedInstanceIds != null ? new ConcurrentHashMap<>(this.joinedInstanceIds) : null;
         c.accessConfig = this.accessConfig;
+        c.creatorArn = this.creatorArn;
+        c.metricsServer = this.metricsServer;
         return c;
     }
 }

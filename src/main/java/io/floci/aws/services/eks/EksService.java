@@ -1,12 +1,16 @@
 package io.floci.aws.services.eks;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.EpochSeconds;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.core.common.TagHandler;
@@ -37,6 +41,7 @@ import io.floci.aws.services.eks.model.CreateClusterRequest;
 import io.floci.aws.services.eks.model.CreateFargateProfileRequest;
 import io.floci.aws.services.eks.model.CreateNodeGroupRequest;
 import io.floci.aws.services.eks.model.EncryptionConfig;
+import io.floci.aws.services.eks.model.ErrorDetail;
 import io.floci.aws.services.eks.model.FargateProfile;
 import io.floci.aws.services.eks.model.FargateProfileStatus;
 import io.floci.aws.services.eks.model.KubernetesNetworkConfig;
@@ -48,6 +53,14 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateClusterVersionRequest;
+import io.floci.aws.services.eks.model.UpdateNodegroupConfigRequest;
+import io.floci.aws.services.eks.model.UpdateNodegroupVersionRequest;
+import io.floci.aws.services.eks.model.UpdateParam;
+import io.floci.aws.services.iam.IamService;
+import io.quarkus.arc.Arc;
+import io.quarkus.arc.ArcContainer;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -64,11 +77,14 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
@@ -94,6 +110,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
      *  qualifier relies on — see EksClusterManager#accountQualifiedName. */
     static final String CLUSTER_NAME_REGEX = "[0-9A-Za-z][A-Za-z0-9\\-_]*";
 
+    private static final ObjectMapper UPDATE_PARAMS = new ObjectMapper();
+    private static final String METRICS_SERVER_ADDON = "metrics-server";
+    private static final long CLUSTER_UPDATE_READY_TIMEOUT_MILLIS = 300_000;
+
     private static final String CLUSTER_SG_DESCRIPTION =
             "EKS created security group applied to ENI that is attached to EKS Control Plane master nodes, as well as any managed workloads.";
 
@@ -108,7 +128,20 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     private final EksAccessEntryService accessEntries;
     private final EksPodIdentityAssociationService podIdentityAssociations;
     private final EksAddonService addons;
+    private final IamService iamService;
+    private final RequestContext requestContext;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    private final ExecutorService updateRunner = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "floci-eks-update");
+        thread.setDaemon(true);
+        return thread;
+    });
+    // One thread, so add-on changes reach the cluster in the order they were made.
+    private final ExecutorService addonRunner = Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "floci-eks-addon");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final Map<String, UserDataClaim> appliedClusterUserData = new ConcurrentHashMap<>();
     private final Map<String, Object> nodeGroupCapacityLocks = new ConcurrentHashMap<>();
     private final Map<String, CompletableFuture<Boolean>> pendingFirstNodeGroups = new ConcurrentHashMap<>();
@@ -121,7 +154,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
             EksOidcService oidcService, EksAccessEntryService accessEntries,
             EksPodIdentityAssociationService podIdentityAssociations,
-            EksAddonService addons) {
+            EksAddonService addons, IamService iamService, RequestContext requestContext) {
         this.storage = storageFactory.create("eks", "eks-clusters.json",
                 new TypeReference<Map<String, Cluster>>() {
                 });
@@ -139,9 +172,20 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         this.accessEntries = accessEntries;
         this.podIdentityAssociations = podIdentityAssociations;
         this.addons = addons;
+        this.iamService = iamService;
+        this.requestContext = requestContext;
         if (this.clusterManager != null) {
             this.clusterManager.setEc2Service(this.ec2Service);
         }
+    }
+
+    public EksService(StorageFactory storageFactory, EmulatorConfig config,
+            RegionResolver regionResolver, EksClusterManager clusterManager, Ec2Service ec2Service,
+            EksOidcService oidcService, EksAccessEntryService accessEntries,
+            EksPodIdentityAssociationService podIdentityAssociations,
+            EksAddonService addons) {
+        this(storageFactory, config, regionResolver, clusterManager, ec2Service,
+                oidcService, accessEntries, podIdentityAssociations, addons, null, null);
     }
 
     public EksService(StorageFactory storageFactory, EmulatorConfig config,
@@ -178,6 +222,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 ec2Service.restoreAttachedVolumesForInstance(reg, nodeInst);
             });
         }
+        abandonInterruptedUpdates();
         if (!config.services().eks().mock()) {
             restorePersistedClusters();
         } else {
@@ -200,7 +245,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             Cluster cluster = entry.value();
             if (cluster.getContainerId() != null
                     || (cluster.getStatus() != ClusterStatus.ACTIVE
-                            && cluster.getStatus() != ClusterStatus.CREATING)) {
+                            && cluster.getStatus() != ClusterStatus.CREATING
+                            && cluster.getStatus() != ClusterStatus.UPDATING)) {
                 continue;
             }
             // Cluster.accountId is @JsonIgnore, so a reloaded record carries none — the owning
@@ -247,6 +293,36 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 }
             }
             putClusterForAccount(entry.accountId(), cluster);
+        }
+    }
+
+    /**
+     * Ends the cluster and node group updates a previous run left in progress: the work they stood for
+     * did not survive the restart, so each is marked Failed and its cluster or node group goes back to
+     * ACTIVE, as EKS reports a finished update.
+     */
+    private void abandonInterruptedUpdates() {
+        for (AccountAwareStorageBackend.AccountEntry<Cluster> entry : allClusterEntries()) {
+            Cluster cluster = entry.value();
+            RequestScopes.runAs(entry.accountId(), () -> {
+                if (addons != null) {
+                    for (String updateId : addons.inProgressUpdateIds(cluster)) {
+                        addons.finishUpdate(cluster, updateId, "Failed", List.of(new ErrorDetail("Unknown",
+                                "Floci restarted before the update finished", List.of(cluster.getName()))));
+                    }
+                }
+                if (cluster.getStatus() == ClusterStatus.UPDATING) {
+                    cluster.setStatus(ClusterStatus.ACTIVE);
+                    putClusterForAccount(entry.accountId(), cluster);
+                }
+                String prefix = cluster.getName() + "/";
+                for (Nodegroup nodegroup : nodeGroupStorage.scan(key -> key.startsWith(prefix))) {
+                    if (nodegroup.getStatus() == NodegroupStatus.UPDATING) {
+                        nodegroup.setStatus(NodegroupStatus.ACTIVE);
+                        nodeGroupStorage.put(nodeGroupKey(cluster.getName(), nodegroup.getNodegroupName()), nodegroup);
+                    }
+                }
+            });
         }
     }
 
@@ -340,7 +416,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         } else {
             groups = nodeGroupStorage.scan(key -> key.startsWith(prefix));
         }
-        return groups.stream().filter(group -> group.getStatus() == NodegroupStatus.ACTIVE)
+        return groups.stream().filter(group -> group.getStatus() == NodegroupStatus.ACTIVE
+                        || group.getStatus() == NodegroupStatus.UPDATING)
                 .min(Comparator.comparing(Nodegroup::getCreatedAt,
                         Comparator.nullsLast(Comparator.naturalOrder()))
                 .thenComparing(Nodegroup::getNodegroupName));
@@ -583,6 +660,8 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
     @PreDestroy
     public void shutdown() {
         poller.shutdownNow();
+        updateRunner.shutdownNow();
+        addonRunner.shutdownNow();
         if (!config.services().eks().mock()) {
             boolean keepRunning = config.services().eks().keepRunningOnShutdown();
             for (Cluster cluster : allClusters()) {
@@ -629,14 +708,21 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         AccessConfig accessConfig = new AccessConfig(authenticationMode,
                 requestedAccess == null || requestedAccess.bootstrapClusterCreatorAdminPermissions() == null
                         || requestedAccess.bootstrapClusterCreatorAdminPermissions());
+        if ("CONFIG_MAP".equals(authenticationMode) && !accessConfig.bootstrapClusterCreatorAdminPermissions()) {
+            throw new AwsException("InvalidParameterException",
+                    "bootstrapClusterCreatorAdminPermissions must be true if cluster authentication mode is set to CONFIG_MAP",
+                    400);
+        }
         String region = regionResolver.getRegion();
         String resolvedVpcId = validateSubnetsAndResolveVpcId(region, request.getResourcesVpcConfig());
         String accountId = regionResolver.getAccountId();
         String arn = AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + name).toString();
+        IamService.CallerArns creator = resolveCreator(accountId);
 
         Cluster cluster = new Cluster();
         cluster.setName(name);
         cluster.setAccessConfig(accessConfig);
+        cluster.setCreatorArn(creator == null ? null : creator.principalArn());
         cluster.setArn(arn);
         cluster.setAccountId(accountId);
         cluster.setCreatedAt(Instant.now());
@@ -697,6 +783,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         cluster.setStatus(ClusterStatus.CREATING);
         cluster.setPlatformVersion("eks.1");
         cluster.setCertificateAuthority(new CertificateAuthority(""));
+        cluster.setMetricsServer(false);
 
         try {
             String issuer = oidcService.newIssuerUrl(region);
@@ -720,6 +807,11 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
 
             storage.put(name, cluster);
+            if (creator != null && AwsArnUtils.isArnFor(creator.principalArn(), "iam")
+                    && !"CONFIG_MAP".equals(authenticationMode)
+                    && accessConfig.bootstrapClusterCreatorAdminPermissions()) {
+                accessEntries.bootstrapCreatorEntry(cluster, creator.principalArn(), creator.userId());
+            }
         } catch (RuntimeException e) {
             if (clusterSg != null) {
                 try {
@@ -733,6 +825,24 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
         }
 
         return cluster;
+    }
+
+    /**
+     * The IAM principal making this CreateCluster call, as GetCallerIdentity reports it, the account
+     * root for a key IAM does not know. Null outside a request or without IAM, which leaves the
+     * cluster on the authentication clusters created before the creator was recorded keep.
+     */
+    private IamService.CallerArns resolveCreator(String accountId) {
+        if (iamService == null || requestContext == null) {
+            return null;
+        }
+        ArcContainer container = Arc.container();
+        if (container != null && container.isRunning() && !container.requestContext().isActive()) {
+            return null;
+        }
+        String root = regionResolver.buildGlobalArn("iam", accountId, "root");
+        return iamService.resolveCallerArns(requestContext.getAccessKeyId())
+                .orElseGet(() -> IamService.CallerArns.accountRoot(root, accountId));
     }
 
     /**
@@ -771,8 +881,11 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 case "access-entries" -> accessEntries.describe(cluster.get(), name).accessEntryArn();
                 case "pod-identity-associations" -> podIdentityAssociations.describe(cluster.get(), name).associationArn();
                 case "updates" -> {
-                    String addon = addons.updateAddonName(cluster.get(), name);
-                    yield addon == null ? null : addons.describe(cluster.get(), addon).addonArn();
+                    EksAddonService.StoredUpdate target = addons.updateTarget(cluster.get(), name);
+                    yield target.addonName() != null ? addons.describe(cluster.get(), target.addonName()).addonArn()
+                            : target.nodegroupName() != null
+                            ? describeNodeGroup(clusterName, target.nodegroupName()).getNodegroupArn()
+                            : cluster.get().getArn();
                 }
                 default -> null;
             });
@@ -879,7 +992,23 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             if (cluster.getAccountId() == null) {
                 cluster.setAccountId(regionResolver.getAccountId());
             }
+            requireNoAttachedCompute(name);
             return deleteClusterHoldingCapacity(name, cluster);
+        }
+    }
+
+    /**
+     * EKS refuses to delete a cluster that still has managed node groups or Fargate profiles: "If you have
+     * managed node groups or Fargate profiles attached to the cluster, you must delete them first."
+     */
+    private void requireNoAttachedCompute(String name) {
+        if (!clusterNodegroups(name).isEmpty()) {
+            throw new AwsException("ResourceInUseException", "Cluster has nodegroups attached", 409);
+        }
+        String prefix = name + "/";
+        if (!fargateProfileStorage.scan(key -> key.startsWith(prefix)).isEmpty()) {
+            throw new AwsException("ResourceInUseException", "Cluster has Fargate Profiles in ACTIVE/CREATING state",
+                    409);
         }
     }
 
@@ -1024,10 +1153,6 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             boolean firstGroup = firstNodeGroup(clusterName, accountId).isEmpty() && pendingFirst == null;
             if (firstGroup && !config.services().eks().mock() && clusterManager != null) {
                 applyFirstNodeGroupCapacity(clusterName, nodegroupName, currentCluster, nodeGroup);
-                if (currentCluster.getContainerId() != null && currentCluster.getStatus() == ClusterStatus.ACTIVE) {
-                    LOG.infov("EKS cluster {0} is already running; nodegroup {1} node labels and taints are not applied to the running node",
-                            clusterName, nodegroupName);
-                }
             } else if (!firstGroup && pendingFirst == null
                     && !config.services().eks().mock() && clusterManager != null) {
                 if (currentCluster.getNodeInstanceType() == null) {
@@ -1106,7 +1231,24 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                 }
             }
         }
+        if (nodeGroup.getStatus() == NodegroupStatus.ACTIVE) {
+            syncNodeWhenRunning(clusterName);
+        }
         return nodeGroup;
+    }
+
+    /**
+     * Brings the running node in line with the cluster's node groups. A node replaced to change its
+     * capacity is synced by the readiness poller once its API server answers, so it is left alone here.
+     */
+    private void syncNodeWhenRunning(String clusterName) {
+        if (config.services().eks().mock() || clusterManager == null) {
+            return;
+        }
+        storage.get(clusterName)
+                .filter(cluster -> cluster.getContainerId() != null && !cluster.isFinalizePending()
+                        && cluster.getStatus() == ClusterStatus.ACTIVE)
+                .ifPresent(clusterManager::syncNodegroupToNode);
     }
 
     private void applyFirstNodeGroupCapacity(String clusterName, String nodegroupName,
@@ -1203,13 +1345,584 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     public Nodegroup deleteNodeGroup(String clusterName, String nodegroupName) {
         Object capacityLock = capacityLock(regionResolver.getAccountId(), clusterName);
+        Nodegroup nodeGroup;
         synchronized (capacityLock) {
-            Nodegroup nodeGroup = describeNodeGroup(clusterName, nodegroupName);
+            nodeGroup = describeNodeGroup(clusterName, nodegroupName);
             nodeGroup.setStatus(NodegroupStatus.DELETING);
             nodeGroup.setModifiedAt(Instant.now());
             nodeGroupStorage.delete(nodeGroupKey(clusterName, nodegroupName));
-            return nodeGroup;
+            if (addons != null) {
+                addons.deleteNodegroupUpdates(describeCluster(clusterName), nodegroupName);
+            }
         }
+        syncNodeWhenRunning(clusterName);
+        return nodeGroup;
+    }
+
+    // ─── Updates ───────────────────────────────────────────────────────────────
+
+    /**
+     * UpdateClusterVersion: moves the control plane one minor version up. The cluster is UPDATING
+     * while Floci recreates its k3s container on the new version's image, keeping the data volume
+     * and the API server port, and ACTIVE again once the new API server answers.
+     */
+    public Update updateClusterVersion(String name, UpdateClusterVersionRequest request) {
+        String accountId = regionResolver.getAccountId();
+        String region = regionResolver.getRegion();
+        String token = request == null ? null : request.clientRequestToken();
+        Cluster cluster;
+        Update update;
+        String target;
+        synchronized (capacityLock(accountId, name)) {
+            cluster = describeCluster(name);
+            Optional<Update> repeated = addons == null ? Optional.empty() : addons.updateForToken(cluster, null, token);
+            if (repeated.isPresent()) {
+                return repeated.get();
+            }
+            target = request == null || request.version() == null ? "" : request.version().trim();
+            if (target.isEmpty()) {
+                throw new AwsException("InvalidParameterException", "version is required", 400);
+            }
+            Matcher matcher = K8S_VERSION_PATTERN.matcher(target);
+            if (!matcher.matches()) {
+                throw new AwsException("InvalidParameterException",
+                        "The specified parameter version is not valid: " + target, 400);
+            }
+            requireNoUpdateInProgress(cluster);
+            int targetMinor = Integer.parseInt(matcher.group(1));
+            if (targetMinor != minorVersion(cluster.getVersion()) + 1) {
+                throw new AwsException("InvalidParameterException",
+                        "Unsupported Kubernetes minor version update from " + cluster.getVersion() + " to " + target,
+                        400);
+            }
+            List<String> behind = clusterNodegroups(name).stream()
+                    .filter(group -> group.getVersion() != null && !group.getVersion().equals(cluster.getVersion()))
+                    .map(Nodegroup::getNodegroupName).sorted().toList();
+            if (!behind.isEmpty()) {
+                throw new AwsException("InvalidRequestException", "Nodegroups " + String.join(", ", behind)
+                        + " must be updated to match cluster version " + cluster.getVersion()
+                        + " before updating cluster version", 400);
+            }
+            requireRunnableVersion(cluster, targetMinor, target);
+            update = newUpdate("VersionUpdate", List.of(new UpdateParam("Version", target),
+                    new UpdateParam("PlatformVersion", "eks.1")));
+            if (addons != null) {
+                addons.recordUpdate(cluster, update, null, token);
+            }
+            cluster.setStatus(ClusterStatus.UPDATING);
+            putCluster(cluster);
+        }
+        String version = target;
+        if (runsContainer(cluster)) {
+            updateRunner.execute(() -> RequestScopes.runAs(accountId, region,
+                    () -> completeClusterVersionUpdate(accountId, cluster, update.id(), version)));
+        } else {
+            completeClusterVersionUpdate(accountId, cluster, update.id(), version);
+        }
+        return update;
+    }
+
+    private void completeClusterVersionUpdate(String accountId, Cluster cluster, String updateId, String version) {
+        String previousVersion = cluster.getVersion();
+        boolean previousExplicit = cluster.isExplicitVersion();
+        String failure = null;
+        boolean replaced = false;
+        synchronized (capacityLock(accountId, cluster.getName())) {
+            if (!stillStored(accountId, cluster)) {
+                return;
+            }
+            cluster.setVersion(version);
+            cluster.setExplicitVersion(true);
+            if (runsContainer(cluster)) {
+                try {
+                    replaced = clusterManager.restartForVersion(cluster);
+                    if (!replaced) {
+                        failure = "Floci could not start Kubernetes " + version + "; the cluster keeps running "
+                                + previousVersion;
+                    }
+                } catch (RuntimeException e) {
+                    failure = e.getMessage();
+                    cluster.setStatus(ClusterStatus.FAILED);
+                }
+                if (!replaced) {
+                    cluster.setVersion(previousVersion);
+                    cluster.setExplicitVersion(previousExplicit);
+                }
+            }
+            if (!stillStored(accountId, cluster)) {
+                return;
+            }
+            putCluster(cluster);
+        }
+        if (replaced && failure == null) {
+            failure = awaitApiServer(cluster);
+        }
+        if (failure == null) {
+            cluster.setPlatformVersion("eks.1");
+            LOG.infov("EKS cluster {0} now runs Kubernetes {1}", cluster.getName(), version);
+        } else {
+            LOG.errorv("Kubernetes version update of EKS cluster {0} to {1} failed: {2}",
+                    cluster.getName(), version, failure);
+        }
+        synchronized (capacityLock(accountId, cluster.getName())) {
+            if (!stillStored(accountId, cluster)) {
+                return;
+            }
+            if (cluster.getStatus() == ClusterStatus.UPDATING) {
+                cluster.setStatus(ClusterStatus.ACTIVE);
+            }
+            putCluster(cluster);
+        }
+        finishUpdate(cluster, updateId, failure);
+    }
+
+    /** False once the cluster was deleted, or replaced by one recreated under its name, so it is not written back. */
+    private boolean stillStored(String accountId, Cluster cluster) {
+        return !isClusterDeleting(accountId, cluster) && findAuthenticationCluster(accountId, cluster.getName())
+                .filter(current -> current == cluster).isPresent();
+    }
+
+    /** Null once the replaced API server answers and its certificate authority is read; else why not. */
+    private String awaitApiServer(Cluster cluster) {
+        long deadline = System.currentTimeMillis() + CLUSTER_UPDATE_READY_TIMEOUT_MILLIS;
+        while (!clusterManager.isReady(cluster)) {
+            if (System.currentTimeMillis() > deadline) {
+                return "The Kubernetes API server did not answer within "
+                        + CLUSTER_UPDATE_READY_TIMEOUT_MILLIS / 1000 + " seconds";
+            }
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return "Interrupted while waiting for the Kubernetes API server";
+            }
+        }
+        clusterManager.finalizeCluster(cluster);
+        return null;
+    }
+
+    /**
+     * A cluster created without a version runs the configured default image, whatever minor version it
+     * reports. Recreating it on an older Kubernetes minor than that image runs would downgrade its data,
+     * which k3s does not support, so that update is refused.
+     */
+    private void requireRunnableVersion(Cluster cluster, int targetMinor, String target) {
+        if (cluster.isExplicitVersion() || !runsContainer(cluster)) {
+            return;
+        }
+        clusterManager.runningKubernetesMinor(cluster).ifPresent(running -> {
+            if (running > targetMinor) {
+                throw new AwsException("InvalidRequestException", "Cluster " + cluster.getName()
+                        + " was created without a version and runs Kubernetes 1." + running
+                        + " from the default image; Floci cannot move it to " + target
+                        + ". Recreate the cluster with an explicit version to update it.", 400);
+            }
+        });
+    }
+
+    /**
+     * UpdateNodegroupConfig: changes a node group's labels, taints, scaling, update, repair or warm
+     * pool configuration. The node group is UPDATING until the change is stored and its labels and
+     * taints are on the running node.
+     */
+    public Update updateNodegroupConfig(String clusterName, String nodegroupName, UpdateNodegroupConfigRequest request) {
+        UpdateNodegroupConfigRequest change = request != null ? request
+                : new UpdateNodegroupConfigRequest(null, null, null, null, null, null, null);
+        String accountId = regionResolver.getAccountId();
+        String region = regionResolver.getRegion();
+        Cluster cluster;
+        Nodegroup nodegroup;
+        Update update;
+        Map<String, String> labels;
+        List<Object> taints;
+        NodegroupScalingConfig scaling;
+        synchronized (capacityLock(accountId, clusterName)) {
+            cluster = describeCluster(clusterName);
+            nodegroup = describeNodeGroup(clusterName, nodegroupName);
+            Optional<Update> repeated = addons == null ? Optional.empty()
+                    : addons.updateForToken(cluster, nodegroupName, change.clientRequestToken());
+            if (repeated.isPresent()) {
+                return repeated.get();
+            }
+            requireNodegroupUpdatable(cluster, nodegroup);
+            List<UpdateParam> params = new ArrayList<>();
+            labels = updatedLabels(nodegroup, change.labels(), params);
+            taints = updatedTaints(nodegroup, change.taints(), params);
+            scaling = updatedScaling(nodegroup, change.scalingConfig(), params);
+            if (change.updateConfig() != null) {
+                addParam(params, "MaxUnavailable", change.updateConfig().get("maxUnavailable"));
+                addParam(params, "MaxUnavailablePercentage", change.updateConfig().get("maxUnavailablePercentage"));
+                addParam(params, "UpdateStrategy", change.updateConfig().get("updateStrategy"));
+            }
+            if (change.nodeRepairConfig() != null) {
+                addParam(params, "NodeRepairEnabled", change.nodeRepairConfig().get("enabled"));
+            }
+            if (change.warmPoolConfig() != null) {
+                addParam(params, "WarmPoolEnabled", change.warmPoolConfig().get("enabled"));
+                addParam(params, "WarmPoolMinSize", change.warmPoolConfig().get("minSize"));
+                addParam(params, "WarmPoolMaxGroupPreparedCapacity",
+                        change.warmPoolConfig().get("maxGroupPreparedCapacity"));
+                addParam(params, "WarmPoolState", change.warmPoolConfig().get("poolState"));
+                addParam(params, "WarmPoolReuseOnScaleIn", change.warmPoolConfig().get("reuseOnScaleIn"));
+            }
+            if (params.isEmpty()) {
+                throw new AwsException("InvalidParameterException",
+                        "At least one node group configuration change must be specified", 400);
+            }
+            update = newUpdate("ConfigUpdate", params);
+            if (addons != null) {
+                addons.recordUpdate(cluster, update, nodegroupName, change.clientRequestToken());
+            }
+            nodegroup.setStatus(NodegroupStatus.UPDATING);
+            nodegroup.setModifiedAt(Instant.now());
+            nodeGroupStorage.put(nodeGroupKey(clusterName, nodegroupName), nodegroup);
+        }
+        Nodegroup updating = nodegroup;
+        Runnable completion = () -> completeNodegroupUpdate(accountId, cluster, updating, update.id(), group -> {
+            group.setLabels(labels);
+            group.setTaints(taints);
+            group.setScalingConfig(scaling);
+            if (change.updateConfig() != null) {
+                group.setUpdateConfig(change.updateConfig());
+            }
+            if (change.nodeRepairConfig() != null) {
+                group.setNodeRepairConfig(change.nodeRepairConfig());
+            }
+            if (change.warmPoolConfig() != null) {
+                group.setWarmPoolConfig(change.warmPoolConfig());
+            }
+        });
+        runNodegroupUpdate(accountId, region, cluster, completion);
+        return update;
+    }
+
+    /**
+     * UpdateNodegroupVersion: moves a node group to a Kubernetes version no newer than its cluster's,
+     * or to another release or launch template version. The node is the cluster's own k3s node, which
+     * runs the control plane's version already, so only the node group record and the node's image
+     * label change.
+     */
+    public Update updateNodegroupVersion(String clusterName, String nodegroupName,
+                                         UpdateNodegroupVersionRequest request) {
+        UpdateNodegroupVersionRequest change = request != null ? request
+                : new UpdateNodegroupVersionRequest(null, null, null, null, null);
+        String accountId = regionResolver.getAccountId();
+        String region = regionResolver.getRegion();
+        Cluster cluster;
+        Nodegroup nodegroup;
+        Update update;
+        String version;
+        String releaseVersion;
+        synchronized (capacityLock(accountId, clusterName)) {
+            cluster = describeCluster(clusterName);
+            nodegroup = describeNodeGroup(clusterName, nodegroupName);
+            Optional<Update> repeated = addons == null ? Optional.empty()
+                    : addons.updateForToken(cluster, nodegroupName, change.clientRequestToken());
+            if (repeated.isPresent()) {
+                return repeated.get();
+            }
+            requireNodegroupUpdatable(cluster, nodegroup);
+            version = change.version() == null || change.version().isBlank()
+                    ? cluster.getVersion() : change.version().trim();
+            Matcher matcher = K8S_VERSION_PATTERN.matcher(version);
+            if (!matcher.matches()) {
+                throw new AwsException("InvalidParameterException",
+                        "The specified parameter version is not valid: " + version, 400);
+            }
+            int minor = Integer.parseInt(matcher.group(1));
+            if (minor > minorVersion(cluster.getVersion())) {
+                throw new AwsException("InvalidParameterException", "Nodegroup version " + version
+                        + " cannot be newer than cluster version " + cluster.getVersion(), 400);
+            }
+            String current = nodegroup.getVersion() != null ? nodegroup.getVersion() : cluster.getVersion();
+            if (minor < minorVersion(current)) {
+                throw new AwsException("InvalidParameterException", "Nodegroup " + nodegroupName
+                        + " cannot be rolled back from version " + current + " to " + version, 400);
+            }
+            releaseVersion = change.releaseVersion() != null && !change.releaseVersion().isBlank()
+                    ? change.releaseVersion().trim() : version + "-eks-1";
+            List<UpdateParam> params = new ArrayList<>(List.of(new UpdateParam("Version", version),
+                    new UpdateParam("ReleaseVersion", releaseVersion)));
+            if (change.launchTemplate() != null) {
+                requireSameLaunchTemplate(nodegroup, change.launchTemplate());
+                validateLaunchTemplate(resolveClusterRegion(cluster), change.launchTemplate());
+                addParam(params, "LaunchTemplateName", change.launchTemplate().get("name"));
+                addParam(params, "LaunchTemplateVersion", change.launchTemplate().get("version"));
+            }
+            update = newUpdate("VersionUpdate", params);
+            if (addons != null) {
+                addons.recordUpdate(cluster, update, nodegroupName, change.clientRequestToken());
+            }
+            nodegroup.setStatus(NodegroupStatus.UPDATING);
+            nodegroup.setModifiedAt(Instant.now());
+            nodeGroupStorage.put(nodeGroupKey(clusterName, nodegroupName), nodegroup);
+        }
+        Nodegroup updating = nodegroup;
+        Runnable completion = () -> completeNodegroupUpdate(accountId, cluster, updating, update.id(), group -> {
+            group.setVersion(version);
+            group.setReleaseVersion(releaseVersion);
+            if (change.launchTemplate() != null) {
+                Map<String, Object> launchTemplate = new LinkedHashMap<>();
+                if (group.getLaunchTemplate() instanceof Map<?, ?> previous) {
+                    previous.forEach((key, value) -> launchTemplate.put(String.valueOf(key), value));
+                }
+                change.launchTemplate().forEach((key, value) -> {
+                    if (value != null) {
+                        launchTemplate.put(key, value);
+                    }
+                });
+                group.setLaunchTemplate(launchTemplate);
+            }
+        });
+        runNodegroupUpdate(accountId, region, cluster, completion);
+        return update;
+    }
+
+    private void runNodegroupUpdate(String accountId, String region, Cluster cluster, Runnable completion) {
+        if (runsContainer(cluster)) {
+            updateRunner.execute(() -> RequestScopes.runAs(accountId, region, completion));
+        } else {
+            completion.run();
+        }
+    }
+
+    private void completeNodegroupUpdate(String accountId, Cluster cluster, Nodegroup nodegroup, String updateId,
+                                         Consumer<Nodegroup> change) {
+        String key = nodeGroupKey(cluster.getName(), nodegroup.getNodegroupName());
+        synchronized (capacityLock(accountId, cluster.getName())) {
+            Optional<Nodegroup> current = nodeGroupStorage.get(key)
+                    .filter(stored -> Objects.equals(stored.getNodegroupArn(), nodegroup.getNodegroupArn()));
+            if (current.isEmpty()) {
+                finishUpdate(cluster, updateId, "The node group was deleted before the update finished");
+                return;
+            }
+            change.accept(current.get());
+            current.get().setStatus(NodegroupStatus.ACTIVE);
+            current.get().setModifiedAt(Instant.now());
+            nodeGroupStorage.put(key, current.get());
+        }
+        syncNodeWhenRunning(cluster.getName());
+        finishUpdate(cluster, updateId, null);
+    }
+
+    private void finishUpdate(Cluster cluster, String updateId, String failure) {
+        if (addons == null) {
+            return;
+        }
+        addons.finishUpdate(cluster, updateId, failure == null ? "Successful" : "Failed", failure == null ? List.of()
+                : List.of(new ErrorDetail("Unknown", failure, List.of(cluster.getName()))));
+    }
+
+    private boolean runsContainer(Cluster cluster) {
+        return !config.services().eks().mock() && clusterManager != null && cluster.getContainerId() != null;
+    }
+
+    private static Update newUpdate(String type, List<UpdateParam> params) {
+        return new Update(UUID.randomUUID().toString(), "InProgress", type, List.copyOf(params),
+                EpochSeconds.fromInstant(Instant.now()), List.of());
+    }
+
+    private static int minorVersion(String version) {
+        Matcher matcher = version == null ? null : K8S_VERSION_PATTERN.matcher(version);
+        return matcher != null && matcher.matches() ? Integer.parseInt(matcher.group(1)) : -1;
+    }
+
+    private static void requireNoUpdateInProgress(Cluster cluster) {
+        if (cluster.getStatus() != ClusterStatus.ACTIVE || cluster.isFinalizePending()) {
+            throw new AwsException("ResourceInUseException", "Cluster " + cluster.getName() + " is "
+                    + (cluster.isFinalizePending() ? "replacing its node" : cluster.getStatus())
+                    + "; it can be updated only while ACTIVE", 409);
+        }
+    }
+
+    /** A node replaced for capacity syncs the node groups once it registers, so it does not block this. */
+    private static void requireNodegroupUpdatable(Cluster cluster, Nodegroup nodegroup) {
+        if (cluster.getStatus() != ClusterStatus.ACTIVE) {
+            throw new AwsException("ResourceInUseException", "Cluster " + cluster.getName() + " is "
+                    + cluster.getStatus() + "; its node groups can be updated only while it is ACTIVE", 409);
+        }
+        if (nodegroup.getStatus() != NodegroupStatus.ACTIVE) {
+            throw new AwsException("ResourceInUseException", "Nodegroup " + nodegroup.getNodegroupName()
+                    + " is " + nodegroup.getStatus() + "; it can be updated only while ACTIVE", 409);
+        }
+    }
+
+    private List<Nodegroup> clusterNodegroups(String clusterName) {
+        String prefix = clusterName + "/";
+        return nodeGroupStorage.scan(key -> key.startsWith(prefix));
+    }
+
+    private static Map<String, String> updatedLabels(Nodegroup nodegroup, UpdateNodegroupConfigRequest.Labels change,
+                                                     List<UpdateParam> params) {
+        if (change == null) {
+            return nodegroup.getLabels();
+        }
+        Map<String, String> add = change.addOrUpdateLabels() == null ? Map.of() : change.addOrUpdateLabels();
+        List<String> remove = change.removeLabels() == null ? List.of() : change.removeLabels();
+        List<String> both = remove.stream().filter(add::containsKey).sorted().toList();
+        if (!both.isEmpty()) {
+            throw new AwsException("InvalidParameterException", "Labels " + both
+                    + " cannot be both added or updated and removed", 400);
+        }
+        if (add.keySet().stream().anyMatch(key -> key == null || key.isBlank())
+                || add.values().stream().anyMatch(Objects::isNull)) {
+            throw new AwsException("InvalidParameterException", "Label keys and values must be nonempty", 400);
+        }
+        Map<String, String> labels = new HashMap<>(nodegroup.getLabels() == null ? Map.of() : nodegroup.getLabels());
+        labels.putAll(add);
+        remove.forEach(labels::remove);
+        if (!add.isEmpty()) {
+            params.add(new UpdateParam("LabelsToAdd", toJson(new TreeMap<>(add))));
+        }
+        if (!remove.isEmpty()) {
+            params.add(new UpdateParam("LabelsToRemove", toJson(remove)));
+        }
+        return labels;
+    }
+
+    private static List<Object> updatedTaints(Nodegroup nodegroup, UpdateNodegroupConfigRequest.Taints change,
+                                              List<UpdateParam> params) {
+        if (change == null) {
+            return nodegroup.getTaints();
+        }
+        List<Map<String, Object>> add = normalizedTaints(change.addOrUpdateTaints());
+        List<Map<String, Object>> remove = normalizedTaints(change.removeTaints());
+        List<Object> taints = new ArrayList<>(nodegroup.getTaints() == null ? List.of() : nodegroup.getTaints());
+        taints.removeIf(existing -> existing instanceof Map<?, ?> map && (add.stream().anyMatch(taint -> sameTaint(map, taint))
+                || remove.stream().anyMatch(taint -> sameTaint(map, taint))));
+        taints.addAll(add);
+        if (taints.size() > 50) {
+            throw new AwsException("InvalidParameterException", "A node group can have at most 50 taints", 400);
+        }
+        if (!add.isEmpty()) {
+            params.add(new UpdateParam("TaintsToAdd", toJson(add)));
+        }
+        if (!remove.isEmpty()) {
+            params.add(new UpdateParam("TaintsToRemove", toJson(remove)));
+        }
+        return taints;
+    }
+
+    private static List<Map<String, Object>> normalizedTaints(List<Map<String, Object>> taints) {
+        List<Map<String, Object>> normalized = new ArrayList<>();
+        for (Map<String, Object> taint : taints == null ? List.<Map<String, Object>>of() : taints) {
+            Object key = taint == null ? null : taint.get("key");
+            Object effect = taint == null ? null : taint.get("effect");
+            if (key == null || key.toString().isBlank()
+                    || effect == null || !Set.of("NO_SCHEDULE", "NO_EXECUTE", "PREFER_NO_SCHEDULE").contains(effect.toString())) {
+                throw new AwsException("InvalidParameterException",
+                        "A taint needs a key and an effect of NO_SCHEDULE, NO_EXECUTE or PREFER_NO_SCHEDULE", 400);
+            }
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("key", key.toString());
+            if (taint.get("value") != null) {
+                entry.put("value", taint.get("value").toString());
+            }
+            entry.put("effect", effect.toString());
+            normalized.add(entry);
+        }
+        return normalized;
+    }
+
+    private static boolean sameTaint(Map<?, ?> existing, Map<String, Object> taint) {
+        return Objects.equals(String.valueOf(existing.get("key")), taint.get("key"))
+                && Objects.equals(String.valueOf(existing.get("effect")), taint.get("effect"));
+    }
+
+    private static NodegroupScalingConfig updatedScaling(Nodegroup nodegroup, NodegroupScalingConfig change,
+                                                         List<UpdateParam> params) {
+        NodegroupScalingConfig current = nodegroup.getScalingConfig();
+        if (change == null) {
+            return current;
+        }
+        NodegroupScalingConfig scaling = new NodegroupScalingConfig();
+        scaling.setMinSize(change.getMinSize() != null ? change.getMinSize() : current == null ? null : current.getMinSize());
+        scaling.setMaxSize(change.getMaxSize() != null ? change.getMaxSize() : current == null ? null : current.getMaxSize());
+        scaling.setDesiredSize(change.getDesiredSize() != null ? change.getDesiredSize()
+                : current == null ? null : current.getDesiredSize());
+        int min = scaling.getMinSize() == null ? 0 : scaling.getMinSize();
+        int max = scaling.getMaxSize() == null ? 1 : scaling.getMaxSize();
+        int desired = scaling.getDesiredSize() == null ? min : scaling.getDesiredSize();
+        if (min < 0 || max < 1 || min > max || desired < min || desired > max) {
+            throw new AwsException("InvalidParameterException", "Scaling configuration must satisfy 0 <= minSize <= "
+                    + "desiredSize <= maxSize and maxSize >= 1, but was minSize=" + min + ", desiredSize=" + desired
+                    + ", maxSize=" + max, 400);
+        }
+        addParam(params, "MinSize", change.getMinSize());
+        addParam(params, "MaxSize", change.getMaxSize());
+        addParam(params, "DesiredSize", change.getDesiredSize());
+        return scaling;
+    }
+
+    private static void requireSameLaunchTemplate(Nodegroup nodegroup, Map<String, Object> requested) {
+        if (!(nodegroup.getLaunchTemplate() instanceof Map<?, ?> original)) {
+            throw new AwsException("InvalidParameterException", "Nodegroup " + nodegroup.getNodegroupName()
+                    + " was not created with a launch template, so it cannot be updated with one", 400);
+        }
+        boolean sameId = requested.get("id") != null && Objects.equals(requested.get("id"), original.get("id"));
+        boolean sameName = requested.get("name") != null && Objects.equals(requested.get("name"), original.get("name"));
+        if (!sameId && !sameName) {
+            throw new AwsException("InvalidParameterException", "The launch template ID or name must be the one "
+                    + "nodegroup " + nodegroup.getNodegroupName() + " was created with", 400);
+        }
+    }
+
+    private static void addParam(List<UpdateParam> params, String type, Object value) {
+        if (value != null) {
+            params.add(new UpdateParam(type, value.toString()));
+        }
+    }
+
+    private static String toJson(Object value) {
+        try {
+            return UPDATE_PARAMS.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Runs k3s's bundled metrics-server once the {@code metrics-server} add-on is installed. EKS ships no
+     * metrics-server; its community add-on of that name deploys one.
+     */
+    public void addonInstalled(String clusterName, String addonName) {
+        if (!METRICS_SERVER_ADDON.equalsIgnoreCase(addonName)) {
+            return;
+        }
+        Cluster cluster = describeCluster(clusterName);
+        cluster.setMetricsServer(true);
+        putCluster(cluster);
+        if (runsContainer(cluster)) {
+            addonRunner.execute(() -> clusterManager.setMetricsServerRunning(cluster, true));
+        }
+    }
+
+    /**
+     * Removes the bundled metrics-server when the {@code metrics-server} add-on is deleted, unless the
+     * deletion preserves the add-on's software, as {@code preserve} does in EKS.
+     */
+    public void addonRemoved(String clusterName, String addonName, boolean preserve) {
+        if (!METRICS_SERVER_ADDON.equalsIgnoreCase(addonName) || preserve) {
+            return;
+        }
+        Cluster cluster = describeCluster(clusterName);
+        cluster.setMetricsServer(false);
+        putCluster(cluster);
+        if (runsContainer(cluster)) {
+            addonRunner.execute(() -> clusterManager.setMetricsServerRunning(cluster, false));
+        }
+    }
+
+    /** ListUpdates for the cluster, one of its node groups, or one of its add-ons. */
+    public EksAddonService.UpdateIdsPage listUpdates(String clusterName, String nodegroupName, String addonName,
+                                                     Integer maxResults, String nextToken) {
+        Cluster cluster = describeCluster(clusterName);
+        if (nodegroupName != null && !nodegroupName.isBlank()) {
+            describeNodeGroup(clusterName, nodegroupName.trim());
+        } else if (addonName != null && !addonName.isBlank()) {
+            addons.describe(cluster, addonName);
+        }
+        return addons.listUpdates(cluster, nodegroupName, addonName, maxResults, nextToken);
     }
 
     public FargateProfile createFargateProfile(String clusterName, CreateFargateProfileRequest request) {
@@ -1765,6 +2478,7 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
                         } else {
                             LOG.infov("EKS cluster {0} is now ACTIVE", cluster.getName());
                         }
+                        reconcileAccessPoliciesAsync(cluster);
                         restoreJoinedInstancesAsync(entry.accountId(), cluster);
                     }
                 } else if (cluster.getStatus() == ClusterStatus.ACTIVE && hasPendingJoinedInstances(cluster)) {
@@ -1773,6 +2487,18 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             }
         } catch (Exception e) {
             LOG.error("Error in EKS readiness poller", e);
+        }
+    }
+
+    private void reconcileAccessPoliciesAsync(Cluster cluster) {
+        boolean accessEntriesEnabled = cluster.getAccessConfig() != null
+                && !"CONFIG_MAP".equals(cluster.getAccessConfig().authenticationMode());
+        if (accessEntries != null && cluster.getCreatorArn() != null && accessEntriesEnabled) {
+            CompletableFuture.runAsync(() -> accessEntries.reconcileBindings(cluster))
+                    .exceptionally(e -> {
+                        LOG.warnv(e, "Could not apply the access policies of EKS cluster {0} as RBAC", cluster.getName());
+                        return null;
+                    });
         }
     }
 

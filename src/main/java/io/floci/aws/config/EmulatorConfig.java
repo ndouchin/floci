@@ -3813,8 +3813,10 @@ public interface EmulatorConfig {
 
         /**
          * When true, wires a token-authentication webhook into k3s so that the bearer token
-         * produced by {@code aws eks get-token} is validated by Floci and mapped to cluster-admin.
-         * This makes the native {@code aws eks update-kubeconfig} + {@code kubectl} flow work.
+         * produced by {@code aws eks get-token} is validated by Floci and mapped to the Kubernetes
+         * identity the cluster's creator, access entries or {@code aws-auth} ConfigMap give the
+         * caller's IAM principal. This makes the native {@code aws eks update-kubeconfig} +
+         * {@code kubectl} flow work.
          */
         @WithDefault("true")
         boolean iamAuthWebhook();
